@@ -1,0 +1,57 @@
+#! /bin/bash
+set -e
+
+export PATH="$PATH:/usr/local/bin"
+
+TEMP=$(getopt -o b:d:C:hr:tu: --long build:,help,test,user: -n ci-build -- "$@")
+eval set -- "$TEMP"
+
+outer_user=${SUDO_USER:-$USER}
+
+while true; do
+    case "$1" in
+        -b|-C|--build) BUILD_DIR=$2; shift 2 ;;
+        -t|--test) TESTS=true; shift ;;
+        -h|--help) echo "Usage: $0 [-b/-C/--build BUILDDIR] [--test]"; exit 0 ;;
+        -u|--user) outer_user=$2; shift 2 ;;
+        --) shift; break ;;
+        *) echo "Internal error!"; exit 1 ;;
+    esac
+done
+
+cd "$BUILD_DIR"
+
+# prepare environment
+if [ $(id -u) -eq 0 ]; then
+  apt-get -qq update
+  apt-get install -y --force-yes equivs devscripts
+  mk-build-deps --install --remove --tool 'apt-get --yes --force-yes'
+  useradd instart || true
+  useradd $outer_user ${SUDO_UID+--uid $SUDO_UID} --home "$BUILD_DIR" || true
+
+  su $outer_user -c "$0 $TEMP"
+
+  # post-build testing
+  case "$TESTS" in
+    y|yes|true)
+      echo 'BEGIN post-build tests'
+      debi ../*.changes || {
+        apt-get install --yes --force-yes -f
+        debi ../*.changes
+      }
+      echo 'END post-build tests'
+      ;;
+  esac
+  exit 0
+fi
+
+# build
+debuild -us -uc -b
+
+# tests
+case "$TESTS" in
+  y|yes|true)
+    echo 'BEGIN tests'
+    echo 'END tests'
+    ;;
+esac
