@@ -1,0 +1,6 @@
+consul (0.6.4-1) unstable; urgency=low
+
+  * Initial Release.
+  * based on https://github.com/bcandrea/consul-deb, made compatible with consul
+
+ -- Michael Weber <mweber@instartlogic.com>  Sun, 14 Aug 2016 23:08:08 -0700
