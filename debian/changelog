@@ -1,3 +1,10 @@
+consul (0.7.0~0.7.1-1) unstable; urgency=low
+
+  * updated to release 0.7
+  * merge fix for GH-2262
+
+ -- Michael Weber <mweber@instartlogic.com>  Wed, 21 Sep 2016 22:48:54 -0700
+
 consul (0.6.4-1) unstable; urgency=low
 
   * Initial Release.
