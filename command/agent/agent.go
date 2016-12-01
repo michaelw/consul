@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/serf/coordinate"
 	"github.com/hashicorp/serf/serf"
 )
@@ -116,14 +117,6 @@ type Agent struct {
 	// agent methods use this, so use with care and never override
 	// outside of a unit test.
 	endpoints map[string]string
-
-	// reapLock is used to prevent child process reaping from interfering
-	// with normal waiting for subprocesses to complete. Any time you exec
-	// and wait, you should take a read lock on this mutex. Only the reaper
-	// takes the write lock. This setup prevents us from serializing all the
-	// child process management with each other, it just serializes them
-	// with the child process reaper.
-	reapLock sync.RWMutex
 }
 
 // Create is used to create a new Agent. Returns
@@ -276,10 +269,6 @@ func (a *Agent) consulConfig() *consul.Config {
 	if a.config.NodeName != "" {
 		base.NodeName = a.config.NodeName
 	}
-	if a.config.BindAddr != "" {
-		base.SerfLANConfig.MemberlistConfig.BindAddr = a.config.BindAddr
-		base.SerfWANConfig.MemberlistConfig.BindAddr = a.config.BindAddr
-	}
 	if a.config.Ports.SerfLan != 0 {
 		base.SerfLANConfig.MemberlistConfig.BindPort = a.config.Ports.SerfLan
 		base.SerfLANConfig.MemberlistConfig.AdvertisePort = a.config.Ports.SerfLan
@@ -294,6 +283,17 @@ func (a *Agent) consulConfig() *consul.Config {
 			Port: a.config.Ports.Server,
 		}
 		base.RPCAddr = bindAddr
+
+		// Set the Serf configs using the old default behavior, we may
+		// override these in the code right below.
+		base.SerfLANConfig.MemberlistConfig.BindAddr = a.config.BindAddr
+		base.SerfWANConfig.MemberlistConfig.BindAddr = a.config.BindAddr
+	}
+	if a.config.SerfLanBindAddr != "" {
+		base.SerfLANConfig.MemberlistConfig.BindAddr = a.config.SerfLanBindAddr
+	}
+	if a.config.SerfWanBindAddr != "" {
+		base.SerfWANConfig.MemberlistConfig.BindAddr = a.config.SerfWanBindAddr
 	}
 	if a.config.AdvertiseAddr != "" {
 		base.SerfLANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddr
@@ -475,6 +475,19 @@ func (a *Agent) RPC(method string, args interface{}, reply interface{}) error {
 		return a.server.RPC(method, args, reply)
 	}
 	return a.client.RPC(method, args, reply)
+}
+
+// SnapshotRPC performs the requested snapshot RPC against the Consul server in
+// a streaming manner. The contents of in will be read and passed along as the
+// payload, and the response message will determine the error status, and any
+// return payload will be written to out.
+func (a *Agent) SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.Writer,
+	replyFn consul.SnapshotReplyFn) error {
+
+	if a.server != nil {
+		return a.server.SnapshotRPC(args, in, out, replyFn)
+	}
+	return a.client.SnapshotRPC(args, in, out, replyFn)
 }
 
 // Leave is used to prepare the agent for a graceful shutdown
@@ -729,6 +742,7 @@ func (a *Agent) reapServices() {
 // persistService saves a service definition to a JSON file in the data dir
 func (a *Agent) persistService(service *structs.NodeService) error {
 	svcPath := filepath.Join(a.config.DataDir, servicesDir, stringHash(service.ID))
+
 	wrapped := persistedService{
 		Token:   a.state.ServiceToken(service.ID),
 		Service: service,
@@ -737,18 +751,8 @@ func (a *Agent) persistService(service *structs.NodeService) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(svcPath), 0700); err != nil {
-		return err
-	}
-	fh, err := os.OpenFile(svcPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	defer fh.Close()
-	if _, err := fh.Write(encoded); err != nil {
-		return err
-	}
-	return nil
+
+	return writeFileAtomic(svcPath, encoded)
 }
 
 // purgeService removes a persisted service definition file from the data dir
@@ -775,18 +779,8 @@ func (a *Agent) persistCheck(check *structs.HealthCheck, chkType *CheckType) err
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(checkPath), 0700); err != nil {
-		return err
-	}
-	fh, err := os.OpenFile(checkPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	defer fh.Close()
-	if _, err := fh.Write(encoded); err != nil {
-		return err
-	}
-	return nil
+
+	return writeFileAtomic(checkPath, encoded)
 }
 
 // purgeCheck removes a persisted check definition file from the data dir
@@ -796,6 +790,34 @@ func (a *Agent) purgeCheck(checkID types.CheckID) error {
 		return os.Remove(checkPath)
 	}
 	return nil
+}
+
+// writeFileAtomic writes the given contents to a temporary file in the same
+// directory, does an fsync and then renames the file to its real path
+func writeFileAtomic(path string, contents []byte) error {
+	uuid, err := uuid.GenerateUUID()
+	if err != nil {
+		return err
+	}
+	tempPath := fmt.Sprintf("%s-%s.tmp", path, uuid)
+
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	fh, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := fh.Write(contents); err != nil {
+		return err
+	}
+	if err := fh.Sync(); err != nil {
+		return err
+	}
+	if err := fh.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 // AddService is used to add a service entry.
@@ -824,7 +846,7 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes CheckTypes, pe
 	// Warn if any tags are incompatible with DNS
 	for _, tag := range service.Tags {
 		if !dnsNameRe.MatchString(tag) {
-			a.logger.Printf("[WARN] Service tag %q will not be discoverable "+
+			a.logger.Printf("[DEBUG] Service tag %q will not be discoverable "+
 				"via DNS due to invalid characters. Valid characters include "+
 				"all alpha-numerics and dashes.", tag)
 		}
@@ -890,7 +912,14 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 	}
 
 	// Remove service immediately
-	a.state.RemoveService(serviceID)
+	err := a.state.RemoveService(serviceID)
+
+	// TODO: Return the error instead of just logging here in Consul 0.8
+	// For now, keep the current idempotent behavior on deleting a nonexistent service
+	if err != nil {
+		a.logger.Printf("[WARN] agent: Failed to deregister service %q: %s", serviceID, err)
+		return nil
+	}
 
 	// Remove the service from the data dir
 	if persist {
@@ -970,12 +999,13 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *CheckType, persist
 			}
 
 			http := &CheckHTTP{
-				Notify:   &a.state,
-				CheckID:  check.CheckID,
-				HTTP:     chkType.HTTP,
-				Interval: chkType.Interval,
-				Timeout:  chkType.Timeout,
-				Logger:   a.logger,
+				Notify:        &a.state,
+				CheckID:       check.CheckID,
+				HTTP:          chkType.HTTP,
+				Interval:      chkType.Interval,
+				Timeout:       chkType.Timeout,
+				Logger:        a.logger,
+				TLSSkipVerify: chkType.TLSSkipVerify,
 			}
 			http.Start()
 			a.checkHTTPs[check.CheckID] = http
@@ -1042,7 +1072,6 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *CheckType, persist
 				Interval: chkType.Interval,
 				Timeout:  chkType.Timeout,
 				Logger:   a.logger,
-				ReapLock: &a.reapLock,
 			}
 			monitor.Start()
 			a.checkMonitors[check.CheckID] = monitor
@@ -1172,8 +1201,16 @@ func (a *Agent) persistCheckState(check *CheckTTL, status, output string) error 
 
 	// Write the state to the file
 	file := filepath.Join(dir, checkIDHash(check.CheckID))
-	if err := ioutil.WriteFile(file, buf, 0600); err != nil {
-		return fmt.Errorf("failed writing file %q: %s", file, err)
+
+	// Create temp file in same dir, to make more likely atomic
+	tempFile := file + ".tmp"
+
+	// persistCheckState is called frequently, so don't use writeFileAtomic to avoid calling fsync here
+	if err := ioutil.WriteFile(tempFile, buf, 0600); err != nil {
+		return fmt.Errorf("failed writing temp file %q: %s", tempFile, err)
+	}
+	if err := os.Rename(tempFile, file); err != nil {
+		return fmt.Errorf("failed to rename temp file from %q to %q: %s", tempFile, file, err)
 	}
 
 	return nil
@@ -1194,7 +1231,8 @@ func (a *Agent) loadCheckState(check *structs.HealthCheck) error {
 	// Decode the state data
 	var p persistedCheckState
 	if err := json.Unmarshal(buf, &p); err != nil {
-		return fmt.Errorf("failed decoding check state: %s", err)
+		a.logger.Printf("[ERROR] agent: failed decoding check state: %s", err)
+		return a.purgeCheckState(check.CheckID)
 	}
 
 	// Check if the state has expired

@@ -92,10 +92,24 @@ The options below are all specified on the command-line.
 * <a name="_bind"></a><a href="#_bind">`-bind`</a> - The address that should be bound to
   for internal cluster communications.
   This is an IP address that should be reachable by all other nodes in the cluster.
-  By default, this is "0.0.0.0", meaning Consul will use the first available private
-  IPv4 address. If you specify "[::]", Consul will use the first available public IPv6 address.
+  By default, this is "0.0.0.0", meaning Consul will bind to all addresses on
+the local machine and will [advertise](/docs/agent/options.html#_advertise)
+the first available private IPv4 address to the rest of the cluster. If there
+are multiple private IPv4 addresses available, Consul will exit with an error
+at startup. If you specify "[::]", Consul will
+[advertise](/docs/agent/options.html#_advertise) the first available public
+IPv6 address. If there are multiple public IPv6 addresses available, Consul
+will exit with an error at startup.
   Consul uses both TCP and UDP and the same port for both. If you
   have any firewalls, be sure to allow both protocols.
+
+* <a name="_serf_wan_bind"></a><a href="#_serf_wan_bind">`-serf-wan-bind`</a> - The address that should be bound to for Serf WAN gossip communications.
+  By default, the value follows the same rules as [`-bind` command-line flag](#_bind), and if this is not specified, the `-bind` option is used. This
+  is available in Consul 0.7.1 and later.
+
+* <a name="_serf_lan_bind"></a><a href="#_serf_lan_bind">`-serf-lan-bind`</a> - The address that should be bound to for Serf LAN gossip communications.
+  This is an IP address that should be reachable by all other LAN nodes in the cluster. By default, the value follows the same rules as
+  [`-bind` command-line flag](#_bind), and if this is not specified, the `-bind` option is used. This is available in Consul 0.7.1 and later.
 
 * <a name="_client"></a><a href="#_client">`-client`</a> - The address to which
   Consul will bind client interfaces,
@@ -174,8 +188,29 @@ The options below are all specified on the command-line.
 
 * <a name="_retry_join"></a><a href="#_retry_join">`-retry-join`</a> - Similar
   to [`-join`](#_join) but allows retrying a join if the first
-  attempt fails. This is useful for cases where we know the address will become
-  available eventually.
+  attempt fails. The list should contain IPv4 addresses with optional Serf
+  LAN port number also specified or bracketed IPv6 addresses with optional
+  port number — for example: `[::1]:8301`. This is useful for cases where we
+  know the address will become available eventually.
+
+* <a name="_retry_join_ec2_tag_key"></a><a href="#_retry_join_ec2_tag_key">`-retry-join-ec2-tag-key`
+  </a> - The Amazon EC2 instance tag key to filter on. When used with
+  [`-retry-join-ec2-tag-value`](#_retry_join_ec2_tag_value), Consul will attempt to join EC2
+  instances with the given tag key and value on startup.
+  </br></br>For AWS authentication the following methods are supported, in order:
+  - Static credentials (from the config file)
+  - Environment variables (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`)
+  - Shared credentials file (`~/.aws/credentials` or the path specified by `AWS_SHARED_CREDENTIALS_FILE`)
+  - ECS task role metadata (container-specific).
+  - EC2 instance role metadata.
+
+* <a name="_retry_join_ec2_tag_value"></a><a href="#_retry_join_ec2_tag_value">`-retry-join-ec2-tag-value`
+  </a> - The Amazon EC2 instance tag value to filter on.
+
+* <a name="_retry_join_ec2_region"></a><a href="#_retry_join_ec2_region">`-retry-join-ec2-region`
+  </a> - (Optional) The Amazon EC2 region to use. If not specified, Consul
+   will use the local instance's [EC2 metadata endpoint](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html)
+   to discover the region.
 
 * <a name="_retry_interval"></a><a href="#_retry_interval">`-retry-interval`</a> - Time
   to wait between join attempts. Defaults to 30s.
@@ -389,9 +424,9 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   can also place the desired values in `CONSUL_RPC_ADDR` and `CONSUL_HTTP_ADDR`
   environment variables.
   <br><br>
-  For TCP addresses, these should simply be an IP address without the port. For
-  example: `10.0.0.1`, not `10.0.0.1:8500`. Ports are set separately in the
-  <a href="#ports">`ports`</a> structure.
+  For TCP addresses, the variable values should be an IP address with the port. For
+  example: `10.0.0.1:8500` and not `10.0.0.1`. However, ports are set separately in the
+  <a href="#ports">`ports`</a> structure when defining them in a configuration file.
   <br><br>
   The following keys are valid:
   * `dns` - The DNS server. Defaults to `client_addr`
@@ -400,6 +435,12 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   * `rpc` - The CLI RPC endpoint. Defaults to `client_addr`
 * <a name="advertise_addr"></a><a href="#advertise_addr">`advertise_addr`</a> Equivalent to
   the [`-advertise` command-line flag](#_advertise).
+
+* <a name="serf_wan_bind"></a><a href="#serf_wan_bind">`serf_wan_bind`</a> Equivalent to
+  the [`-serf-wan-bind` command-line flag](#_serf_wan_bind).
+
+* <a name="serf_lan_bind"></a><a href="#serf_lan_bind">`serf_lan_bind`</a> Equivalent to
+  the [`-serf-lan-bind` command-line flag](#_serf_lan_bind).
 
 * <a name="advertise_addrs"></a><a href="#advertise_addrs">`advertise_addrs`</a> Allows to set
   the advertised addresses for SerfLan, SerfWan and RPC together with the port. This gives
@@ -428,6 +469,9 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 
 * <a name="atlas_token"></a><a href="#atlas_token">`atlas_token`</a> Equivalent to the
   [`-atlas-token` command-line flag](#_atlas_token).
+
+* <a name="atlas_endpoint"></a><a href="#atlas_endpoint">`atlas_endpoint`</a> Equivalent to the
+  [`-atlas-endpoint` command-line flag](#_atlas_endpoint).
 
 * <a name="atlas_endpoint"></a><a href="#atlas_endpoint">`atlas_endpoint`</a> Equivalent to the
   [`-atlas-endpoint` command-line flag](#_atlas_endpoint).
@@ -492,39 +536,42 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   by the leader, providing stronger consistency but less throughput and higher latency. In Consul
   0.7 and later, this defaults to true for better utilization of available servers.
 
-  * <a name="max_stale"></a><a href="#max_stale">`max_stale`</a> When [`allow_stale`](#allow_stale)
-  is specified, this is used to limit how
-  stale results are allowed to be. By default, this is set to "5s":
-  if a Consul server is more than 5 seconds behind the leader, the query will be
-  re-evaluated on the leader to get more up-to-date results.
+  * <a name="max_stale"></a><a href="#max_stale">`max_stale`</a> - When [`allow_stale`](#allow_stale)
+  is specified, this is used to limit how stale results are allowed to be. If a Consul server is
+  behind the leader by more than `max_stale`, the query will be re-evaluated on the leader to get
+  more up-to-date results. Prior to Consul 0.7.1 this defaulted to 5 seconds; in Consul 0.7.1
+  and later this defaults to 10 years ("87600h") which effectively allows DNS queries to be answered
+  by any server, no matter how stale. In practice, servers are usually only milliseconds behind the
+  leader, so this lets Consul continue serving requests in long outage scenarios where no leader can
+  be elected.
 
-  * <a name="node_ttl"></a><a href="#node_ttl">`node_ttl`</a> By default, this is "0s", so all
+  * <a name="node_ttl"></a><a href="#node_ttl">`node_ttl`</a> - By default, this is "0s", so all
   node lookups are served with a 0 TTL value. DNS caching for node lookups can be enabled by
   setting this value. This should be specified with the "s" suffix for second or "m" for minute.
 
-  * <a name="service_ttl"></a><a href="#service_ttl">`service_ttl`</a> This is a sub-object
+  * <a name="service_ttl"></a><a href="#service_ttl">`service_ttl`</a> - This is a sub-object
   which allows for setting a TTL on service lookups with a per-service policy. The "*" wildcard
   service can be used when there is no specific policy available for a service. By default, all
   services are served with a 0 TTL value. DNS caching for service lookups can be enabled by
   setting this value.
 
-  * <a name="enable_truncate"></a><a href="#enable_truncate">`enable_truncate`</a> If set to
+  * <a name="enable_truncate"></a><a href="#enable_truncate">`enable_truncate`</a> - If set to
   true, a UDP DNS query that would return more than 3 records, or more than would fit into a valid
   UDP response, will set the truncated flag, indicating to clients that they should re-query
   using TCP to get the full set of records.
 
-  * <a name="only_passing"></a><a href="#only_passing">`only_passing`</a> If set to true, any
+  * <a name="only_passing"></a><a href="#only_passing">`only_passing`</a> - If set to true, any
   nodes whose health checks are warning or critical will be excluded from DNS results. If false,
   the default, only nodes whose healthchecks are failing as critical will be excluded. For
   service lookups, the health checks of the node itself, as well as the service-specific checks
   are considered. For example, if a node has a health check that is critical then all services on
   that node will be excluded because they are also considered critical.
 
-  * <a name="recursor_timeout"></a><a href="#recursor_timeout">`recursor_timeout`</a> Timeout used
+  * <a name="recursor_timeout"></a><a href="#recursor_timeout">`recursor_timeout`</a> - Timeout used
   by Consul when recursively querying an upstream DNS server. See <a href="#recursors">`recursors`</a>
   for more details. Default is 2s. This is available in Consul 0.7 and later.
 
-  * <a name="disable_compression"></a><a href="#disable_compression">`disable_compression`</a> If
+  * <a name="disable_compression"></a><a href="#disable_compression">`disable_compression`</a> - If
   set to true, DNS responses will not be compressed. Compression was added and enabled by default
   in Consul 0.7.
 
@@ -622,7 +669,10 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="reap"></a><a href="#reap">`reap`</a> This controls Consul's automatic reaping of child processes,
   which is useful if Consul is running as PID 1 in a Docker container. If this isn't specified, then Consul will
   automatically reap child processes if it detects it is running as PID 1. If this is set to true or false, then
-  it controls reaping regardless of Consul's PID (forces reaping on or off, respectively).
+  it controls reaping regardless of Consul's PID (forces reaping on or off, respectively). This option was removed
+  in Consul 0.7.1. For later versions of Consul, you will need to reap processes using a wrapper, please see the
+  [Consul Docker image entry point script](https://github.com/hashicorp/docker-consul/blob/master/0.X/docker-entrypoint.sh)
+  for an example.
 
 * <a name="reconnect_timeout"></a><a href="#reconnect_timeout">`reconnect_timeout`</a> This controls
   how long it takes for a failed node to be completely removed from the cluster. This defaults to
@@ -652,7 +702,20 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="retry_join"></a><a href="#retry_join">`retry_join`</a> Equivalent to the
   [`-retry-join` command-line flag](#_retry_join). Takes a list
   of addresses to attempt joining every [`retry_interval`](#_retry_interval) until at least one
-  [`-join`](#_join) works.
+  join works. The list should contain IPv4 addresses with optional Serf LAN port number also specified or bracketed IPv6 addresses with optional port number — for example: `[::1]:8301`.
+
+* <a name="retry_join_ec2"></a><a href="#retry_join_ec2">`retry_join_ec2`</a> - This is a nested object
+  that allows the setting of EC2-related [`-retry-join`](#_retry_join) options.
+  <br><br>
+  The following keys are valid:
+  * `region` - The AWS region. Equivalent to the
+    [`-retry-join-ec2-region` command-line flag](#_retry_join_ec2_region).
+  * `tag_key` - The EC2 instance tag key to filter on. Equivalent to the</br>
+    [`-retry-join-ec2-tag-key` command-line flag](#_retry_join_ec2_tag_key).
+  * `tag_value` - The EC2 instance tag value to filter on. Equivalent to the</br>
+    [`-retry-join-ec2-tag-value` command-line flag](#_retry_join_ec2_tag_value).
+  * `access_key_id` - The AWS access key ID to use for authentication.
+  * `secret_access_key` - The AWS secret access key to use for authentication.
 
 * <a name="retry_interval"></a><a href="#retry_interval">`retry_interval`</a> Equivalent to the
   [`-retry-interval` command-line flag](#_retry_interval).
@@ -660,7 +723,7 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="retry_join_wan"></a><a href="#retry_join_wan">`retry_join_wan`</a> Equivalent to the
   [`-retry-join-wan` command-line flag](#_retry_join_wan). Takes a list
   of addresses to attempt joining to WAN every [`retry_interval_wan`](#_retry_interval_wan) until at least one
-  [`-join-wan`](#_join_wan) works.
+  join works.
 
 * <a name="retry_interval_wan"></a><a href="#retry_interval_wan">`retry_interval_wan`</a> Equivalent to the
   [`-retry-interval-wan` command-line flag](#_retry_interval_wan).

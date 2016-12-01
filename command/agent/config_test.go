@@ -179,13 +179,22 @@ func TestDecodeConfig(t *testing.T) {
 	}
 
 	// Server addrs
-	input = `{"ports": {"server": 8000}, "bind_addr": "127.0.0.2", "advertise_addr": "127.0.0.3"}`
+	input = `{"ports": {"server": 8000}, "bind_addr": "127.0.0.2", "advertise_addr": "127.0.0.3", "serf_lan_bind": "127.0.0.4", "serf_wan_bind": "52.54.55.56"}`
 	config, err = DecodeConfig(bytes.NewReader([]byte(input)))
+
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	if config.BindAddr != "127.0.0.2" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.SerfWanBindAddr != "52.54.55.56" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.SerfLanBindAddr != "127.0.0.4" {
 		t.Fatalf("bad: %#v", config)
 	}
 
@@ -929,27 +938,6 @@ func TestDecodeConfig(t *testing.T) {
 	if config.SessionTTLMin != 5*time.Second {
 		t.Fatalf("bad: %s %#v", config.SessionTTLMin.String(), config)
 	}
-
-	// Reap
-	input = `{"reap": true}`
-	config, err = DecodeConfig(bytes.NewReader([]byte(input)))
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if config.Reap == nil || *config.Reap != true {
-		t.Fatalf("bad: reap not enabled: %#v", config)
-	}
-
-	input = `{}`
-	config, err = DecodeConfig(bytes.NewReader([]byte(input)))
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if config.Reap != nil {
-		t.Fatalf("bad: reap not tri-stated: %#v", config)
-	}
 }
 
 func TestDecodeConfig_invalidKeys(t *testing.T) {
@@ -957,6 +945,36 @@ func TestDecodeConfig_invalidKeys(t *testing.T) {
 	_, err := DecodeConfig(bytes.NewReader([]byte(input)))
 	if err == nil || !strings.Contains(err.Error(), "invalid keys") {
 		t.Fatalf("should have rejected invalid config keys")
+	}
+}
+
+func TestRetryJoinEC2(t *testing.T) {
+	input := `{"retry_join_ec2": {
+	  "region": "us-east-1",
+		"tag_key": "ConsulRole",
+		"tag_value": "Server",
+		"access_key_id": "asdf",
+		"secret_access_key": "qwerty"
+	}}`
+	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if config.RetryJoinEC2.Region != "us-east-1" {
+		t.Fatalf("bad: %#v", config)
+	}
+	if config.RetryJoinEC2.TagKey != "ConsulRole" {
+		t.Fatalf("bad: %#v", config)
+	}
+	if config.RetryJoinEC2.TagValue != "Server" {
+		t.Fatalf("bad: %#v", config)
+	}
+	if config.RetryJoinEC2.AccessKeyID != "asdf" {
+		t.Fatalf("bad: %#v", config)
+	}
+	if config.RetryJoinEC2.SecretAccessKey != "qwerty" {
+		t.Fatalf("bad: %#v", config)
 	}
 }
 
@@ -1157,6 +1175,23 @@ func TestDecodeConfig_Checks(t *testing.T) {
 				"interval": "10s",
 				"timeout": "100ms",
 				"service_id": "elasticsearch"
+			},
+			{
+				"id": "chk5",
+				"name": "service:sslservice",
+				"HTTP": "https://sslservice/status",
+				"interval": "10s",
+				"timeout": "100ms",
+				"service_id": "sslservice"
+			},
+			{
+				"id": "chk6",
+				"name": "service:insecure-sslservice",
+				"HTTP": "https://insecure-sslservice/status",
+				"interval": "10s",
+				"timeout": "100ms",
+				"service_id": "insecure-sslservice",
+				"tls_skip_verify": true
 			}
 		]
 	}`
@@ -1201,6 +1236,28 @@ func TestDecodeConfig_Checks(t *testing.T) {
 					HTTP:     "http://localhost:9200/_cluster_health",
 					Interval: 10 * time.Second,
 					Timeout:  100 * time.Millisecond,
+				},
+			},
+			&CheckDefinition{
+				ID:        "chk5",
+				Name:      "service:sslservice",
+				ServiceID: "sslservice",
+				CheckType: CheckType{
+					HTTP:          "https://sslservice/status",
+					Interval:      10 * time.Second,
+					Timeout:       100 * time.Millisecond,
+					TLSSkipVerify: false,
+				},
+			},
+			&CheckDefinition{
+				ID:        "chk6",
+				Name:      "service:insecure-sslservice",
+				ServiceID: "insecure-sslservice",
+				CheckType: CheckType{
+					HTTP:          "https://insecure-sslservice/status",
+					Interval:      10 * time.Second,
+					Timeout:       100 * time.Millisecond,
+					TLSSkipVerify: true,
 				},
 			},
 		},
@@ -1391,6 +1448,13 @@ func TestMergeConfig(t *testing.T) {
 		CheckUpdateIntervalRaw: "8m",
 		RetryIntervalRaw:       "10s",
 		RetryIntervalWanRaw:    "10s",
+		RetryJoinEC2: RetryJoinEC2{
+			Region:          "us-east-1",
+			TagKey:          "Key1",
+			TagValue:        "Value1",
+			AccessKeyID:     "nope",
+			SecretAccessKey: "nope",
+		},
 		Telemetry: Telemetry{
 			DisableHostname: false,
 			StatsdAddr:      "nope",
@@ -1513,8 +1577,15 @@ func TestMergeConfig(t *testing.T) {
 		AtlasToken:          "123456789",
 		AtlasACLToken:       "abcdefgh",
 		AtlasJoin:           true,
-		SessionTTLMinRaw:    "1000s",
-		SessionTTLMin:       1000 * time.Second,
+		RetryJoinEC2: RetryJoinEC2{
+			Region:          "us-east-2",
+			TagKey:          "Key2",
+			TagValue:        "Value2",
+			AccessKeyID:     "foo",
+			SecretAccessKey: "bar",
+		},
+		SessionTTLMinRaw: "1000s",
+		SessionTTLMin:    1000 * time.Second,
 		AdvertiseAddrs: AdvertiseAddrsConfig{
 			SerfLan:    &net.TCPAddr{},
 			SerfLanRaw: "127.0.0.5:1231",
@@ -1523,7 +1594,6 @@ func TestMergeConfig(t *testing.T) {
 			RPC:        &net.TCPAddr{},
 			RPCRaw:     "127.0.0.5:1233",
 		},
-		Reap: Bool(true),
 	}
 
 	c := MergeConfig(a, b)

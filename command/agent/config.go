@@ -118,6 +118,20 @@ type DNSConfig struct {
 	RecursorTimeoutRaw string        `mapstructure:"recursor_timeout" json:"-"`
 }
 
+// RetryJoinEC2 is used to configure discovery of instances via Amazon's EC2 api
+type RetryJoinEC2 struct {
+	// The AWS region to look for instances in
+	Region string `mapstructure:"region"`
+
+	// The tag key and value to use when filtering instances
+	TagKey   string `mapstructure:"tag_key"`
+	TagValue string `mapstructure:"tag_value"`
+
+	// The AWS credentials to use for making requests to EC2
+	AccessKeyID     string `mapstructure:"access_key_id"`
+	SecretAccessKey string `mapstructure:"secret_access_key"`
+}
+
 // Performance is used to tune the performance of Consul's subsystems.
 type Performance struct {
 	// RaftMultiplier is an integer multiplier used to scale Raft timing
@@ -279,6 +293,18 @@ type Config struct {
 	// services (Gossip, Server RPC)
 	BindAddr string `mapstructure:"bind_addr"`
 
+	// SerfWanBindAddr is used to control the address we bind to.
+	// If not specified, the first private IP we find is used.
+	// This controls the address we use for cluster facing
+	// services (Gossip) Serf
+	SerfWanBindAddr string `mapstructure:"serf_wan_bind"`
+
+	// SerfLanBindAddr is used to control the address we bind to.
+	// If not specified, the first private IP we find is used.
+	// This controls the address we use for cluster facing
+	// services (Gossip) Serf
+	SerfLanBindAddr string `mapstructure:"serf_lan_bind"`
+
 	// AdvertiseAddr is the address we use for advertising our Serf,
 	// and Consul RPC IP. If not specified, bind address is used.
 	AdvertiseAddr string `mapstructure:"advertise_addr"`
@@ -384,6 +410,9 @@ type Config struct {
 	// the default is 30s.
 	RetryInterval    time.Duration `mapstructure:"-" json:"-"`
 	RetryIntervalRaw string        `mapstructure:"retry_interval"`
+
+	// RetryJoinEC2 configuration
+	RetryJoinEC2 RetryJoinEC2 `mapstructure:"retry_join_ec2"`
 
 	// RetryJoinWan is a list of addresses to join -wan with retry enabled.
 	RetryJoinWan []string `mapstructure:"retry_join_wan"`
@@ -577,12 +606,6 @@ type Config struct {
 	// Minimum Session TTL
 	SessionTTLMin    time.Duration `mapstructure:"-"`
 	SessionTTLMinRaw string        `mapstructure:"session_ttl_min"`
-
-	// Reap controls automatic reaping of child processes, useful if running
-	// as PID 1 in a Docker container. This defaults to nil which will make
-	// Consul reap only if it detects it's running as PID 1. If non-nil,
-	// then this will be used to decide if reaping is enabled.
-	Reap *bool `mapstructure:"reap"`
 }
 
 // Bool is used to initialize bool pointers in struct literals.
@@ -654,7 +677,7 @@ func DefaultConfig() *Config {
 		DNSConfig: DNSConfig{
 			AllowStale:      Bool(true),
 			UDPAnswerLimit:  3,
-			MaxStale:        5 * time.Second,
+			MaxStale:        10 * 365 * 24 * time.Hour,
 			RecursorTimeout: 2 * time.Second,
 		},
 		Telemetry: Telemetry{
@@ -1043,6 +1066,9 @@ func FixupCheckType(raw interface{}) error {
 		case "docker_container_id":
 			rawMap["DockerContainerID"] = v
 			delete(rawMap, k)
+		case "tls_skip_verify":
+			rawMap["TLSSkipVerify"] = v
+			delete(rawMap, k)
 		}
 	}
 
@@ -1168,6 +1194,12 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.AdvertiseAddrWan != "" {
 		result.AdvertiseAddrWan = b.AdvertiseAddrWan
+	}
+	if b.SerfWanBindAddr != "" {
+		result.SerfWanBindAddr = b.SerfWanBindAddr
+	}
+	if b.SerfLanBindAddr != "" {
+		result.SerfLanBindAddr = b.SerfLanBindAddr
 	}
 	if b.TranslateWanAddrs == true {
 		result.TranslateWanAddrs = true
@@ -1328,6 +1360,21 @@ func MergeConfig(a, b *Config) *Config {
 	if b.RetryInterval != 0 {
 		result.RetryInterval = b.RetryInterval
 	}
+	if b.RetryJoinEC2.AccessKeyID != "" {
+		result.RetryJoinEC2.AccessKeyID = b.RetryJoinEC2.AccessKeyID
+	}
+	if b.RetryJoinEC2.SecretAccessKey != "" {
+		result.RetryJoinEC2.SecretAccessKey = b.RetryJoinEC2.SecretAccessKey
+	}
+	if b.RetryJoinEC2.Region != "" {
+		result.RetryJoinEC2.Region = b.RetryJoinEC2.Region
+	}
+	if b.RetryJoinEC2.TagKey != "" {
+		result.RetryJoinEC2.TagKey = b.RetryJoinEC2.TagKey
+	}
+	if b.RetryJoinEC2.TagValue != "" {
+		result.RetryJoinEC2.TagValue = b.RetryJoinEC2.TagValue
+	}
 	if b.RetryMaxAttemptsWan != 0 {
 		result.RetryMaxAttemptsWan = b.RetryMaxAttemptsWan
 	}
@@ -1476,10 +1523,6 @@ func MergeConfig(a, b *Config) *Config {
 	result.RetryJoinWan = make([]string, 0, len(a.RetryJoinWan)+len(b.RetryJoinWan))
 	result.RetryJoinWan = append(result.RetryJoinWan, a.RetryJoinWan...)
 	result.RetryJoinWan = append(result.RetryJoinWan, b.RetryJoinWan...)
-
-	if b.Reap != nil {
-		result.Reap = b.Reap
-	}
 
 	return &result
 }

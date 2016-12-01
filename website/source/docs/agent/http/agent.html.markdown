@@ -22,7 +22,7 @@ The following endpoints are supported:
 * [`/v1/agent/self`](#agent_self) : Returns the local node configuration
 * [`/v1/agent/maintenance`](#agent_maintenance) : Manages node maintenance mode
 * [`/v1/agent/join/<address>`](#agent_join) : Triggers the local agent to join a node
-* [`/v1/agent/force-leave/<node>`](#agent_force_leave)>: Forces removal of a node
+* [`/v1/agent/force-leave/<node>`](#agent_force_leave): Forces removal of a node
 * [`/v1/agent/check/register`](#agent_check_register) : Registers a new local check
 * [`/v1/agent/check/deregister/<checkID>`](#agent_check_deregister) : Deregisters a local check
 * [`/v1/agent/check/pass/<checkID>`](#agent_check_pass) : Marks a local check as passing
@@ -243,7 +243,7 @@ body must look like:
   "ID": "mem",
   "Name": "Memory utilization",
   "Notes": "Ensure we don't oversubscribe memory",
-  "DeregisterCriticalServiceAfter": "90m"
+  "DeregisterCriticalServiceAfter": "90m",
   "Script": "/usr/local/bin/check_mem.py",
   "DockerContainerID": "f972c95ebf0e",
   "Shell": "/bin/bash",
@@ -251,6 +251,7 @@ body must look like:
   "TCP": "example.com:22",
   "Interval": "10s",
   "TTL": "15s",
+  "TLSSkipVerify": true
 }
 ```
 
@@ -282,9 +283,13 @@ evaluate the script every `Interval` in the given container using the specified
 An `HTTP` check will perform an HTTP GET request against the value of `HTTP` (expected to
 be a URL) every `Interval`. If the response is any `2xx` code, the check is `passing`.
 If the response is `429 Too Many Requests`, the check is `warning`. Otherwise, the check
-is `critical`.
+is `critical`. HTTP checks also support SSL. By default, a valid SSL certificate is expected.
+Certificate verification can be controlled using the `TLSSkipVerify`.
 
-An `TCP` check will perform an TCP connection attempt against the value of `TCP`
+If `TLSSkipVerify` is set to `true`, certificate verification will be disabled. By default,
+certificate verification is enabled.
+
+A `TCP` check will perform an TCP connection attempt against the value of `TCP`
 (expected to be an IP/hostname and port combination) every `Interval`.  If the
 connection attempt is successful, the check is `passing`.  If the connection
 attempt is unsuccessful, the check is `critical`.  In the case of a hostname
