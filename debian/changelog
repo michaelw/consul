@@ -1,8 +1,9 @@
-consul (0.7.1-1ubuntu1) precise; urgency=low
+consul (0.7.1-1) precise; urgency=low
 
   * updated to release 0.7.1
+  * use golang-1.7 to build
 
- -- Michael Weber <mweber@instartlogic.com>  Wed, 30 Nov 2016 16:50:00 -0800
+ -- Michael Weber <mweber@instartlogic.com>  Wed, 30 Nov 2016 18:31:11 -0800
 
 consul (0.7.0~0.7.1-1) unstable; urgency=low
 
