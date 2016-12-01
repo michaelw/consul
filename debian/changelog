@@ -1,3 +1,10 @@
+consul (0.7.1-2) precise; urgency=medium
+
+  * make consul "server" opt-in
+  * remove minimum bootstrap_expect=3
+
+ -- Scott Beardsley <sbeardsley@instartlogic.com>  Thu, 01 Dec 2016 03:17:06 +0000
+
 consul (0.7.1-1) precise; urgency=low
 
   * updated to release 0.7.1
