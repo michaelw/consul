@@ -16,6 +16,8 @@
 # This has to be exported to make some magic below work.
 export DH_OPTIONS
 
+VERSION := $(shell dpkg-parsechangelog --count 1 | awk -F': ' '$$1=="Version" {gsub("-.*","",$$2); print $$2}')
+GIT_IMPORT := github.com/hashicorp/consul/version
 
 %:
 	dh $@ 
@@ -26,8 +28,9 @@ override_dh_auto_clean:
 override_dh_auto_build:
 	mkdir -p go/src/github.com/hashicorp go/pkg usr/bin
 	ln -sf $(CURDIR) go/src/github.com/hashicorp/consul
-	PATH=$$PATH:/usr/lib/go-1.7/bin GOPATH=$(CURDIR)/go \
+	PATH=$$PATH:/usr/lib/go-1.8/bin GOPATH=$(CURDIR)/go \
 		go build \
+		-ldflags "-X ${GIT_IMPORT}.GitDescribe=v${VERSION} -X ${GIT_IMPORT}.Version=${VERSION} -X ${GIT_IMPORT}.VersionPrerelease=" \
 		-o usr/bin/consul github.com/hashicorp/consul
 
 override_dh_installchangelogs:
