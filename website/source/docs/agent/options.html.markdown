@@ -13,6 +13,12 @@ the command-line or via configuration files. All of the configuration
 options are completely optional. Defaults are specified with their
 descriptions.
 
+Configuration precedence is evaluated in the following order:
+
+1. Command line arguments
+2. Environment Variables
+3. Configuration files
+
 When loading configuration, Consul loads the configuration from files
 and directories in lexical order. For example, configuration file `basic_config.json`
 will be processed before `extra_config.json`. Configuration specified later
@@ -53,28 +59,6 @@ The options below are all specified on the command-line.
   address when being accessed from a remote datacenter if the remote datacenter is configured
   with <a href="#translate_wan_addrs">`translate_wan_addrs`</a>.
 
-* <a name="_atlas"></a><a href="#_atlas">`-atlas`</a> - This flag
-  enables [Atlas](https://atlas.hashicorp.com) integration.
-  It is used to provide the Atlas infrastructure name and the SCADA connection. The format of
-  this is `username/environment`. This enables Atlas features such as the Monitoring UI
-  and node auto joining.
-
-* <a name="_atlas_join"></a><a href="#_atlas_join">`-atlas-join`</a> - When set, enables auto-join
-  via Atlas. Atlas will track the most
-  recent members to join the infrastructure named by [`-atlas`](#_atlas) and automatically
-  join them on start. For servers, the LAN and WAN pool are both joined.
-
-* <a name="_atlas_token"></a><a href="#_atlas_token">`-atlas-token`</a> - Provides the Atlas
-  API authentication token. This can also be provided
-  using the `ATLAS_TOKEN` environment variable. Required for use with Atlas.
-
-* <a name="_atlas_endpoint"></a><a href="#_atlas_endpoint">`-atlas-endpoint`</a> - The endpoint
-  address used for Atlas integration. Used only if the `-atlas` and
-  `-atlas-token` options are specified. This is optional, and defaults to the
-  public Atlas endpoints. This can also be specified using the `SCADA_ENDPOINT`
-  environment variable. The CLI option takes precedence, followed by the
-  configuration file directive, and lastly, the environment variable.
-
 * <a name="_bootstrap"></a><a href="#_bootstrap">`-bootstrap`</a> - This flag is used to control if a
   server is in "bootstrap" mode. It is important that
   no more than one server *per* datacenter be running in this mode. Technically, a server in bootstrap mode
@@ -88,6 +72,7 @@ The options below are all specified on the command-line.
   the cluster. When provided, Consul waits until the specified number of servers are
   available and then bootstraps the cluster. This allows an initial leader to be elected
   automatically. This cannot be used in conjunction with the legacy [`-bootstrap`](#_bootstrap) flag.
+  This flag implies server mode.
 
 * <a name="_bind"></a><a href="#_bind">`-bind`</a> - The address that should be bound to
   for internal cluster communications.
@@ -112,10 +97,8 @@ will exit with an error at startup.
   [`-bind` command-line flag](#_bind), and if this is not specified, the `-bind` option is used. This is available in Consul 0.7.1 and later.
 
 * <a name="_client"></a><a href="#_client">`-client`</a> - The address to which
-  Consul will bind client interfaces,
-  including the HTTP, DNS, and RPC servers. By default, this is "127.0.0.1",
-  allowing only loopback connections. The RPC address is used by other Consul
-  commands, such as `consul members`, in order to query a running Consul agent.
+  Consul will bind client interfaces, including the HTTP and DNS servers. By default,
+  this is "127.0.0.1", allowing only loopback connections.
 
 * <a name="_config_file"></a><a href="#_config_file">`-config-file`</a> - A configuration file
   to load. For more information on
@@ -143,17 +126,22 @@ will exit with an error at startup.
   the use of filesystem locking, meaning some types of mounted folders (e.g. VirtualBox
   shared folders) may not be suitable.
 
+* <a name="_datacenter"></a><a href="#_datacenter">`-datacenter`</a> - This flag controls the datacenter in
+  which the agent is running. If not provided,
+  it defaults to "dc1". Consul has first-class support for multiple datacenters, but
+  it relies on proper configuration. Nodes in the same datacenter should be on a single
+  LAN.
+
 * <a name="_dev"></a><a href="#_dev">`-dev`</a> - Enable development server
   mode. This is useful for quickly starting a Consul agent with all persistence
   options turned off, enabling an in-memory server which can be used for rapid
   prototyping or developing against the API. This mode is **not** intended for
   production use as it does not write any data to disk.
 
-* <a name="_datacenter"></a><a href="#_datacenter">`-datacenter`</a> - This flag controls the datacenter in
-  which the agent is running. If not provided,
-  it defaults to "dc1". Consul has first-class support for multiple datacenters, but
-  it relies on proper configuration. Nodes in the same datacenter should be on a single
-  LAN.
+* <a name="_disable_host_node_id"></a><a href="#_disable_host_node_id">`-disable-host-node-id`</a> - Setting
+  this to true will prevent Consul from using information from the host to generate a deterministic node ID,
+  and will instead generate a random node ID which will be persisted in the data directory. This is useful
+  when running multiple Consul agents on the same host for testing. This defaults to false.
 
 * <a name="_dns_port"></a><a href="#_dns_port">`-dns-port`</a> - the DNS port to listen on.
   This overrides the default port 8600. This is available in Consul 0.7 and later.
@@ -185,6 +173,10 @@ will exit with an error at startup.
   specified multiple times to specify multiple agents to join. If Consul is
   unable to join with any of the specified addresses, agent startup will
   fail. By default, the agent won't join any nodes when it starts up.
+  Note that using
+  <a href="#retry_join">`retry_join`</a> could be more appropriate to help
+  mitigate node startup race conditions when automating a Consul cluster
+  deployment.\
 
 * <a name="_retry_join"></a><a href="#_retry_join">`-retry-join`</a> - Similar
   to [`-join`](#_join) but allows retrying a join if the first
@@ -203,6 +195,9 @@ will exit with an error at startup.
   - Shared credentials file (`~/.aws/credentials` or the path specified by `AWS_SHARED_CREDENTIALS_FILE`)
   - ECS task role metadata (container-specific).
   - EC2 instance role metadata.
+  
+  The only required IAM permission is `ec2:DescribeInstances`, and it is recommended you make a dedicated
+  key used only for auto-joining.
 
 * <a name="_retry_join_ec2_tag_value"></a><a href="#_retry_join_ec2_tag_value">`-retry-join-ec2-tag-value`
   </a> - The Amazon EC2 instance tag value to filter on.
@@ -211,6 +206,37 @@ will exit with an error at startup.
   </a> - (Optional) The Amazon EC2 region to use. If not specified, Consul
    will use the local instance's [EC2 metadata endpoint](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html)
    to discover the region.
+
+* <a name="_retry_join_gce_tag_value"></a><a href="#_retry_join_gce_tag_value">`-retry-join-gce-tag-value`
+  </a> - A Google Compute Engine instance tag to filter on. Much like the
+  `-retry-join-ec2-*` options, this gives Consul the option of doing server
+  discovery on [Google Compute Engine](https://cloud.google.com/compute/) by
+  searching the tags assigned to any particular instance.
+
+* <a name="_retry_join_gce_project_name"></a><a href="#_retry_join_gce_project_name">`-retry-join-gce-project-name`
+  </a> - The project to search in for the tag supplied by
+  [`-retry-join-gce-tag-value`](#_retry_join_gce_tag_value). If this is run
+  from within a GCE instance, the default is the project the instance is
+  located in.
+
+* <a name="_retry_join_gce_zone_pattern"></a><a href="#_retry_join_gce_zone_pattern">`-retry-join-gce-zone-pattern`
+  </a> - A regular expression that indicates the zones the tag should be
+  searched in. For example, while `us-west1-a` would only search in
+  `us-west1-a`, `us-west1-.*` would search in `us-west1-a` and `us-west1-b`.
+  The default is to search globally.
+
+* <a name="_retry_join_gce_credentials_file"></a><a href="#_retry_join_gce_credentials_file">`-retry-join-gce-credentials-file`
+  </a> - The path to the JSON credentials file of the [GCE Service
+  Account](https://cloud.google.com/compute/docs/access/service-accounts) that
+  will be used to search for instances. Note that this can also reside in the
+  following locations:
+   - A path supplied by the `GOOGLE_APPLICATION_CREDENTIALS` environment
+     variable
+   - The `%APPDATA%/gcloud/application_default_credentials.json` file (Windows)
+     or `$HOME/.config/gcloud/application_default_credentials.json` (Linux and
+     other systems)
+   - If none of these exist and discovery is being run from a GCE instance, the
+     instance's configured service account will be used.
 
 * <a name="_retry_interval"></a><a href="#_retry_interval">`-retry-interval`</a> - Time
   to wait between join attempts. Defaults to 30s.
@@ -241,12 +267,30 @@ will exit with an error at startup.
 
 * <a name="_log_level"></a><a href="#_log_level">`-log-level`</a> - The level of logging to
   show after the Consul agent has started. This defaults to "info". The available log levels are
-  "trace", "debug", "info", "warn", and "err". Note that you can always connect to an
+  "trace", "debug", "info", "warn", and "err". You can always connect to an
   agent via [`consul monitor`](/docs/commands/monitor.html) and use any log level. Also, the
   log level can be changed during a config reload.
 
 * <a name="_node"></a><a href="#_node">`-node`</a> - The name of this node in the cluster.
   This must be unique within the cluster. By default this is the hostname of the machine.
+
+* <a name="_node_id"></a><a href="#_node_id">`-node-id`</a> - Available in Consul 0.7.3 and later, this
+  is a unique identifier for this node across all time, even if the name of the node or address
+  changes. This must be in the form of a hex string, 36 characters long, such as
+  `adf4238a-882b-9ddc-4a9d-5b6758e4159e`. If this isn't supplied, which is the most common case, then
+  the agent will generate an identifier at startup and persist it in the <a href="#_data_dir">data directory</a>
+  so that it will remain the same across agent restarts. Information from the host will be used to
+  generate a deterministic node ID if possible, unless [`-disable-host-node-id`](#_disable_host_node_id) is
+  set to true.
+
+* <a name="_node_meta"></a><a href="#_node_meta">`-node-meta`</a> - Available in Consul 0.7.3 and later,
+  this specifies an arbitrary metadata key/value pair to associate with the node, of the form `key:value`.
+  This can be specified multiple times. Node metadata pairs have the following restrictions:
+  - A maximum of 64 key/value pairs can be registered per node.
+  - Metadata keys must be between 1 and 128 characters (inclusive) in length
+  - Metadata keys must contain only alphanumeric, `-`, and `_` characters.
+  - Metadata keys must not begin with the `consul-` prefix; that is reserved for internal use by Consul.
+  - Metadata values must be between 0 and 512 (inclusive) characters in length.
 
 * <a name="_pid_file"></a><a href="#_pid_file">`-pid-file`</a> - This flag provides the file
   path for the agent to store its PID. This is useful for sending signals (for example, `SIGINT`
@@ -255,6 +299,11 @@ will exit with an error at startup.
 * <a name="_protocol"></a><a href="#_protocol">`-protocol`</a> - The Consul protocol version to
   use. This defaults to the latest version. This should be set only when [upgrading](/docs/upgrading.html).
   You can view the protocol versions supported by Consul by running `consul -v`.
+
+* <a name="_raft_protocol"></a><a href="#_raft_protocol">`-raft-protocol`</a> - This controls the internal
+  version of the Raft consensus protocol used for server communications. This defaults to 2 but must
+  be set to 3 in order to gain access to Autopilot features, with the exception of
+  [`cleanup_dead_servers`](#cleanup_dead_servers).
 
 * <a name="_recursor"></a><a href="#_recursor">`-recursor`</a> - Specifies the address of an upstream DNS
   server. This option may be provided multiple times, and is functionally
@@ -274,6 +323,11 @@ will exit with an error at startup.
   participate in a WAN gossip pool with server nodes in other datacenters. Servers act as gateways
   to other datacenters and forward traffic as appropriate.
 
+* <a name="_non_voting_server"></a><a href="#_non_voting_server">`-non-voting-server`</a> - (Enterprise-only)
+  This flag is used to make the server not participate in the Raft quorum, and have it only receive the data
+  replication stream. This can be used to add read scalability to a cluster in cases where a high volume of
+  reads to servers are needed.
+
 * <a name="_syslog"></a><a href="#_syslog">`-syslog`</a> - This flag enables logging to syslog. This
   is only supported on Linux and OSX. It will result in an error if provided on Windows.
 
@@ -283,7 +337,7 @@ will exit with an error at startup.
 
 * <a name="_ui_dir"></a><a href="#_ui_dir">`-ui-dir`</a> - This flag provides the directory containing
   the Web UI resources for Consul. This will automatically enable the Web UI. The directory must be
-  readable to the agent.
+  readable to the agent. Starting with Consul version 0.7.0 and later, the Web UI assets are included in the binary so this flag is no longer necessary; specifying only the `-ui` flag is enough to enable the Web UI. Specifying both the '-ui' and '-ui-dir' flags will result in an error.
 
 ## <a name="configuration_files"></a>Configuration Files
 
@@ -344,7 +398,7 @@ definitions support being updated during a reload.
 }
 ```
 
-Note the use of `ports`:
+See, especially, the use of the `ports` setting:
 
 ```javascript
 "ports": {
@@ -356,19 +410,19 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 
 #### Configuration Key Reference
 
-* <a name="acl_datacenter"></a><a href="#acl_datacenter">`acl_datacenter`</a> - Only
-  used by servers. This designates the datacenter which
-  is authoritative for ACL information. It must be provided to enable ACLs.
-  All servers and datacenters must agree on the ACL datacenter. Setting it on
-  the servers is all you need for enforcement, but for the APIs to forward properly
-  from the clients, it must be set on them too. Future changes may move
-  enforcement to the edges, so it's best to just set `acl_datacenter` on all nodes.
+* <a name="acl_datacenter"></a><a href="#acl_datacenter">`acl_datacenter`</a> - This designates
+  the datacenter which is authoritative for ACL information. It must be provided to enable ACLs.
+  All servers and datacenters must agree on the ACL datacenter. Setting it on the servers is all
+  you need for cluster-level enforcement, but for the APIs to forward properly from the clients,
+  it must be set on them too. In Consul 0.8 and later, this also enables agent-level enforcement
+  of ACLs. Please see the [ACL Guide](/docs/guides/acl.html) for more details.
 
 * <a name="acl_default_policy"></a><a href="#acl_default_policy">`acl_default_policy`</a> - Either
   "allow" or "deny"; defaults to "allow". The default policy controls the behavior of a token when
   there is no matching rule. In "allow" mode, ACLs are a blacklist: any operation not specifically
   prohibited is allowed. In "deny" mode, ACLs are a whitelist: any operation not
-  specifically allowed is blocked.
+  specifically allowed is blocked. *Note*: this will not take effect until you've set `acl_datacenter` 
+  to enable ACL support.
 
 * <a name="acl_down_policy"></a><a href="#acl_down_policy">`acl_down_policy`</a> - Either
   "allow", "deny" or "extend-cache"; "extend-cache" is the default. In the case that the
@@ -377,28 +431,48 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   all operations, and "extend-cache" allows any cached ACLs to be used, ignoring their TTL
   values. If a non-cached ACL is used, "extend-cache" acts like "deny".
 
+* <a name="acl_agent_master_token"></a><a href="#acl_agent_master_token">`acl_agent_master_token`</a> -
+  Used to access <a href="/api/agent.html">agent endpoints</a> that require agent read
+  or write privileges even if Consul servers aren't present to validate any tokens. This should only
+  be used by operators during outages, regular ACL tokens should normally be used by applications.
+  This was added in Consul 0.7.2 and is only used when <a href="#acl_enforce_version_8">`acl_enforce_version_8`</a>
+  is set to true.
+
+* <a name="acl_agent_token"></a><a href="#acl_agent_token">`acl_agent_token`</a> - Used for clients
+  and servers to perform internal operations to the service catalog. If this isn't specified, then
+  the <a href="#acl_token">`acl_token`</a> will be used. This was added in Consul 0.7.2.
+  <br><br>
+  This token must at least have write access to the node name it will register as in order to set any
+  of the node-level information in the catalog such as metadata, or the node's tagged addresses.
+
+* <a name="acl_enforce_version_8"></a><a href="#acl_enforce_version_8">`acl_enforce_version_8`</a> -
+  Used for clients and servers to determine if enforcement should occur for new ACL policies being
+  previewed before Consul 0.8. Added in Consul 0.7.2, this defaults to false in versions of
+  Consul prior to 0.8, and defaults to true in Consul 0.8 and later. This helps ease the
+  transition to the new ACL features by allowing policies to be in place before enforcement begins.
+  Please see the [ACL Guide](/docs/guides/acl.html#version_8_acls) for more details.
+
 * <a name="acl_master_token"></a><a href="#acl_master_token">`acl_master_token`</a> - Only used
   for servers in the [`acl_datacenter`](#acl_datacenter). This token will be created with management-level
   permissions if it does not exist. It allows operators to bootstrap the ACL system
   with a token ID that is well-known.
   <br><br>
-  Note that the `acl_master_token` is only installed when a server acquires cluster leadership. If
+  The `acl_master_token` is only installed when a server acquires cluster leadership. If
   you would like to install or change the `acl_master_token`, set the new value for `acl_master_token`
   in the configuration for all servers. Once this is done, restart the current leader to force a
-  leader election. If the acl_master_token is not supplied, then the servers do not create a master
+  leader election. If the `acl_master_token` is not supplied, then the servers do not create a master
   token. When you provide a value, it can be any string value. Using a UUID would ensure that it looks
   the same as the other tokens, but isn't strictly necessary.
 
 * <a name="acl_replication_token"></a><a href="#acl_replication_token">`acl_replication_token`</a> -
   Only used for servers outside the [`acl_datacenter`](#acl_datacenter) running Consul 0.7 or later.
-  When provided, this will enable [ACL replication](/docs/internals/acl.html#replication) using this
+  When provided, this will enable [ACL replication](/docs/guides/acl.html#replication) using this
   token to retrieve and replicate the ACLs to the non-authoritative local datacenter.
   <br><br>
   If there's a partition or other outage affecting the authoritative datacenter, and the
   [`acl_down_policy`](/docs/agent/options.html#acl_down_policy) is set to "extend-cache", tokens not
   in the cache can be resolved during the outage using the replicated set of ACLs. Please see the
-  [ACL replication](/docs/internals/acl.html#replication) section of the internals guide for more
-  details.
+  [ACL Guide](/docs/guides/acl.html#replication) replication section for more details.
 
 * <a name="acl_token"></a><a href="#acl_token">`acl_token`</a> - When provided, the agent will use this
   token when making requests to the Consul servers. Clients can override this token on a per-request
@@ -407,22 +481,21 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 
 * <a name="acl_ttl"></a><a href="#acl_ttl">`acl_ttl`</a> - Used to control Time-To-Live caching of ACLs.
   By default, this is 30 seconds. This setting has a major performance impact: reducing it will cause
-  more frequent refreshes while increasing it reduces the number of caches. However, because the caches
+  more frequent refreshes while increasing it reduces the number of refreshes. However, because the caches
   are not actively invalidated, ACL policy may be stale up to the TTL value.
 
 * <a name="addresses"></a><a href="#addresses">`addresses`</a> - This is a nested object that allows
   setting bind addresses.
   <br><br>
-  Both `rpc` and `http` support binding to Unix domain sockets. A socket can be
+  `http` supports binding to a Unix domain socket. A socket can be
   specified in the form `unix:///path/to/socket`. A new domain socket will be
   created at the given path. If the specified file path already exists, Consul
   will attempt to clear the file and create the domain socket in its place. The
   permissions of the socket file are tunable via the [`unix_sockets` config construct](#unix_sockets).
   <br><br>
   When running Consul agent commands against Unix socket interfaces, use the
-  `-rpc-addr` or `-http-addr` arguments to specify the path to the socket. You
-  can also place the desired values in `CONSUL_RPC_ADDR` and `CONSUL_HTTP_ADDR`
-  environment variables.
+  `-http-addr` argument to specify the path to the socket. You can also place
+  the desired values in the `CONSUL_HTTP_ADDR` environment variable.
   <br><br>
   For TCP addresses, the variable values should be an IP address with the port. For
   example: `10.0.0.1:8500` and not `10.0.0.1`. However, ports are set separately in the
@@ -432,7 +505,6 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   * `dns` - The DNS server. Defaults to `client_addr`
   * `http` - The HTTP API. Defaults to `client_addr`
   * `https` - The HTTPS API. Defaults to `client_addr`
-  * `rpc` - The CLI RPC endpoint. Defaults to `client_addr`
 * <a name="advertise_addr"></a><a href="#advertise_addr">`advertise_addr`</a> Equivalent to
   the [`-advertise` command-line flag](#_advertise).
 
@@ -456,25 +528,38 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="advertise_addr_wan"></a><a href="#advertise_addr_wan">`advertise_addr_wan`</a> Equivalent to
   the [`-advertise-wan` command-line flag](#_advertise-wan).
 
-* <a name="atlas_acl_token"></a><a href="#atlas_acl_token">`atlas_acl_token`</a> When provided,
-  any requests made by Atlas will use this ACL token unless explicitly overridden. When not provided
-  the [`acl_token`](#acl_token) is used. This can be set to 'anonymous' to reduce permission below
-  that of [`acl_token`](#acl_token).
+* <a name="autopilot"></a><a href="#autopilot">`autopilot`</a> Added in Consul 0.8, this object
+  allows a number of sub-keys to be set which can configure operator-friendly settings for Consul servers.
+  For more information about Autopilot, see the [Autopilot Guide](/docs/guides/autopilot.html).
+  <br><br>
+  The following sub-keys are available:
 
-* <a name="atlas_infrastructure"></a><a href="#atlas_infrastructure">`atlas_infrastructure`</a>
-  Equivalent to the [`-atlas` command-line flag](#_atlas).
+  * <a name="cleanup_dead_servers"></a><a href="#cleanup_dead_servers">`cleanup_dead_servers`</a> - This controls
+  the automatic removal of dead server nodes periodically and whenever a new server is added to the cluster.
+  Defaults to `true`.
 
-* <a name="atlas_join"></a><a href="#atlas_join">`atlas_join`</a> Equivalent to the
-  [`-atlas-join` command-line flag](#_atlas_join).
+  * <a name="last_contact_threshold"></a><a href="#last_contact_threshold">`last_contact_threshold`</a> - Controls
+  the maximum amount of time a server can go without contact from the leader before being considered unhealthy.
+  Must be a duration value such as `10s`. Defaults to `200ms`.
 
-* <a name="atlas_token"></a><a href="#atlas_token">`atlas_token`</a> Equivalent to the
-  [`-atlas-token` command-line flag](#_atlas_token).
+  * <a name="max_trailing_logs"></a><a href="#max_trailing_logs">`max_trailing_logs`</a> - Controls
+  the maximum number of log entries that a server can trail the leader by before being considered unhealthy. Defaults
+  to 250.
 
-* <a name="atlas_endpoint"></a><a href="#atlas_endpoint">`atlas_endpoint`</a> Equivalent to the
-  [`-atlas-endpoint` command-line flag](#_atlas_endpoint).
+  * <a name="server_stabilization_time"></a><a href="#server_stabilization_time">`server_stabilization_time`</a> -
+  Controls the minimum amount of time a server must be stable in the 'healthy' state before being added to the
+  cluster. Only takes effect if all servers are running Raft protocol version 3 or higher. Must be a duration value
+  such as `30s`. Defaults to `10s`.
 
-* <a name="atlas_endpoint"></a><a href="#atlas_endpoint">`atlas_endpoint`</a> Equivalent to the
-  [`-atlas-endpoint` command-line flag](#_atlas_endpoint).
+  * <a name="redundancy_zone_tag"></a><a href="#redundancy_zone_tag">`redundancy_zone_tag`</a> - (Enterprise-only)
+  This controls the [`-node-meta`](#_node_meta) key to use when Autopilot is separating servers into zones for
+  redundancy. Only one server in each zone can be a voting member at one time. If left blank (the default), this
+  feature will be disabled.
+
+  * <a name="disable_upgrade_migration"></a><a href="#disable_upgrade_migration">`disable_upgrade_migration`</a> - (Enterprise-only)
+  If set to `true`, this setting will disable Autopilot's upgrade migration strategy in Consul Enterprise of waiting
+  until enough newer-versioned servers have been added to the cluster before promoting any of them to voters. Defaults
+  to `false`.
 
 * <a name="bootstrap"></a><a href="#bootstrap">`bootstrap`</a> Equivalent to the
   [`-bootstrap` command-line flag](#_bootstrap).
@@ -487,6 +572,11 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 
 * <a name="ca_file"></a><a href="#ca_file">`ca_file`</a> This provides a file path to a PEM-encoded
   certificate authority. The certificate authority is used to check the authenticity of client and
+  server connections with the appropriate [`verify_incoming`](#verify_incoming) or
+  [`verify_outgoing`](#verify_outgoing) flags.
+
+* <a name="ca_path"></a><a href="#ca_path">`ca_path`</a> This provides a path to a directory of PEM-encoded
+  certificate authority files. These certificate authorities are used to check the authenticity of client and
   server connections with the appropriate [`verify_incoming`](#verify_incoming) or
   [`verify_outgoing`](#verify_outgoing) flags.
 
@@ -516,9 +606,13 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   `disable_anonymous_signature`</a> Disables providing an anonymous signature for de-duplication
   with the update check. See [`disable_update_check`](#disable_update_check).
 
+* <a name="disable_host_node_id"></a><a href="#disable_host_node_id">`disable_host_node_id`</a>
+  Equivalent to the [`-disable-host-node-id` command-line flag](#_disable_host_node_id).
+
 * <a name="disable_remote_exec"></a><a href="#disable_remote_exec">`disable_remote_exec`</a>
   Disables support for remote execution. When set to true, the agent will ignore any incoming
-  remote exec requests.
+  remote exec requests. In versions of Consul prior to 0.8, this defaulted to false. In Consul
+  0.8 the default was changed to true, to make remote exec opt-in instead of opt-out.
 
 * <a name="disable_update_check"></a><a href="#disable_update_check">`disable_update_check`</a>
   Disables automatic checking for security bulletins and new version releases.
@@ -578,9 +672,9 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   * <a name="udp_answer_limit"></a><a
   href="#udp_answer_limit">`udp_answer_limit`</a> - Limit the number of
   resource records contained in the answer section of a UDP-based DNS
-  response.  When answering a question, Consul will use the complete list of
+  response. When answering a question, Consul will use the complete list of
   matching hosts, shuffle the list randomly, and then limit the number of
-  answers to `udp_answer_limit` (default `3`).  In environments where
+  answers to `udp_answer_limit` (default `3`). In environments where
   [RFC 3484 Section 6](https://tools.ietf.org/html/rfc3484#section-6) Rule 9
   is implemented and enforced (i.e. DNS answers are always sorted and
   therefore never random), clients may need to set this value to `1` to
@@ -630,41 +724,61 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="log_level"></a><a href="#log_level">`log_level`</a> Equivalent to the
   [`-log-level` command-line flag](#_log_level).
 
+* <a name="node_id"></a><a href="#node_id">`node_id`</a> Equivalent to the
+  [`-node-id` command-line flag](#_node_id).
+
 * <a name="node_name"></a><a href="#node_name">`node_name`</a> Equivalent to the
   [`-node` command-line flag](#_node).
+
+* <a name="node_meta"></a><a href="#node_meta">`node_meta`</a> Available in Consul 0.7.3 and later,
+  This object allows associating arbitrary metadata key/value pairs with the local node, which can
+  then be used for filtering results from certain catalog endpoints. See the
+  [`-node-meta` command-line flag](#_node_meta) for more information.
+
+    ```javascript
+      {
+        "node_meta": {
+            "instance_type": "t2.medium"
+        }
+      }
+    ```
 
 * <a name="performance"></a><a href="#performance">`performance`</a> Available in Consul 0.7 and
   later, this is a nested object that allows tuning the performance of different subsystems in
   Consul. See the [Server Performance](/docs/guides/performance.html) guide for more details. The
   following parameters are available:
 
-* <a name="raft_multiplier"></a><a href="#raft_multiplier">`raft_multiplier`</a> - An integer
-  multiplier used by Consul servers to scale key Raft timing parameters. Omitting this value
-  or setting it to 0 uses default timing described below. Lower values are used to tighten
-  timing and increase sensitivity while higher values relax timings and reduce sensitivity.
-  Tuning this affects the time it takes Consul to detect leader failures and to perform
-  leader elections, at the expense of requiring more network and CPU resources for better
-  performance.<br><br>By default, Consul will use a lower-performance timing that's suitable
-  for [minimal Consul servers](/docs/guides/performance.html#minumum), currently equivalent
-  to setting this to a value of 5 (this default may be changed in future versions of Consul,
-  depending if the target minimum server profile changes). Setting this to a value of 1 will
-  configure Raft to its highest-performance mode, equivalent to the default timing of Consul
-  prior to 0.7, and is recommended for [production Consul servers](/docs/guides/performance.html#production).
-  See the note on [last contact](/docs/guides/performance.html#last-contact) timing for more
-  details on tuning this parameter. The maximum allowed value is 10.
+  * <a name="raft_multiplier"></a><a href="#raft_multiplier">`raft_multiplier`</a> - An integer
+    multiplier used by Consul servers to scale key Raft timing parameters. Omitting this value
+    or setting it to 0 uses default timing described below. Lower values are used to tighten
+    timing and increase sensitivity while higher values relax timings and reduce sensitivity.
+    Tuning this affects the time it takes Consul to detect leader failures and to perform
+    leader elections, at the expense of requiring more network and CPU resources for better
+    performance.<br><br>By default, Consul will use a lower-performance timing that's suitable
+    for [minimal Consul servers](/docs/guides/performance.html#minumum), currently equivalent
+    to setting this to a value of 5 (this default may be changed in future versions of Consul,
+    depending if the target minimum server profile changes). Setting this to a value of 1 will
+    configure Raft to its highest-performance mode, equivalent to the default timing of Consul
+    prior to 0.7, and is recommended for [production Consul servers](/docs/guides/performance.html#production).
+    See the note on [last contact](/docs/guides/performance.html#last-contact) timing for more
+    details on tuning this parameter. The maximum allowed value is 10.
 
 * <a name="ports"></a><a href="#ports">`ports`</a> This is a nested object that allows setting
   the bind ports for the following keys:
     * <a name="dns_port"></a><a href="#dns_port">`dns`</a> - The DNS server, -1 to disable. Default 8600.
     * <a name="http_port"></a><a href="#http_port">`http`</a> - The HTTP API, -1 to disable. Default 8500.
     * <a name="https_port"></a><a href="#https_port">`https`</a> - The HTTPS API, -1 to disable. Default -1 (disabled).
-    * <a name="rpc_port"></a><a href="#rpc_port">`rpc`</a> - The CLI RPC endpoint. Default 8400.
+    * <a name="rpc_port"></a><a href="#rpc_port">`rpc`</a> - The CLI RPC endpoint. Default 8400. This is deprecated
+      in Consul 0.8 and later.
     * <a name="serf_lan_port"></a><a href="#serf_lan_port">`serf_lan`</a> - The Serf LAN port. Default 8301.
     * <a name="serf_wan_port"></a><a href="#serf_wan_port">`serf_wan`</a> - The Serf WAN port. Default 8302.
     * <a name="server_rpc_port"></a><a href="#server_rpc_port">`server`</a> - Server RPC address. Default 8300.
 
 * <a name="protocol"></a><a href="#protocol">`protocol`</a> Equivalent to the
   [`-protocol` command-line flag](#_protocol).
+
+* <a name="raft_protocol"></a><a href="#raft_protocol">`raft_protocol`</a> Equivalent to the
+  [`-raft-protocol` command-line flag](#_raft_protocol).
 
 * <a name="reap"></a><a href="#reap">`reap`</a> This controls Consul's automatic reaping of child processes,
   which is useful if Consul is running as PID 1 in a Docker container. If this isn't specified, then Consul will
@@ -717,6 +831,25 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   * `access_key_id` - The AWS access key ID to use for authentication.
   * `secret_access_key` - The AWS secret access key to use for authentication.
 
+* <a name="retry_join_gce"></a><a href="#retry_join_gce">`retry_join_gce`</a> - This is a nested object
+  that allows the setting of GCE-related [`-retry-join`](#_retry_join) options.
+  <br><br>
+  The following keys are valid:
+  * `project_name` - The GCE project name. Equivalent to the<br>
+    [`-retry-join-gce-project-name` command-line
+    flag](#_retry_join_gce_project_name).
+  * `zone_pattern` - The regular expression indicating the zones to search in.
+    Equivalent to the <br>
+    [`-retry-join-gce-zone-pattern` command-line
+    flag](#_retry_join_gce_zone_pattern).
+  * `tag_value` - The GCE instance tag value to filter on. Equivalent to the <br>
+    [`-retry-join-gce-tag-value` command-line
+    flag](#_retry_join_gce_tag_value).
+  * `credentials_file` - The path to the GCE service account credentials file.
+    Equivalent to the <br>
+    [`-retry-join-gce-credentials-file` command-line
+    flag](#_retry_join_gce_credentials_file).
+
 * <a name="retry_interval"></a><a href="#retry_interval">`retry_interval`</a> Equivalent to the
   [`-retry-interval` command-line flag](#_retry_interval).
 
@@ -731,6 +864,9 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="server"></a><a href="#server">`server`</a> Equivalent to the
   [`-server` command-line flag](#_server).
 
+* <a name="non_voting_server"></a><a href="#non_voting_server">`non_voting_server`</a> - Equivalent to the
+  [`-non-voting-server` command-line flag](#_non_voting_server).
+
 * <a name="server_name"></a><a href="#server_name">`server_name`</a> When provided, this overrides
   the [`node_name`](#_node) for the TLS certificate. It can be used to ensure that the certificate
   name matches the hostname we declare.
@@ -744,18 +880,21 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="skip_leave_on_interrupt"></a><a
   href="#skip_leave_on_interrupt">`skip_leave_on_interrupt`</a> This is
   similar to [`leave_on_terminate`](#leave_on_terminate) but only affects
-  interrupt handling.  When Consul receives an interrupt signal (such as
+  interrupt handling. When Consul receives an interrupt signal (such as
   hitting Control-C in a terminal), Consul will gracefully leave the cluster.
-  Setting this to `true` disables that behavior.  The default behavior for
+  Setting this to `true` disables that behavior. The default behavior for
   this feature varies based on whether or not the agent is running as a
   client or a server (prior to Consul 0.7 the default value was
-  unconditionally set to `false`).  On agents in client-mode, this defaults
+  unconditionally set to `false`). On agents in client-mode, this defaults
   to `false` and for agents in server-mode, this defaults to `true`
   (i.e. Ctrl-C on a server will keep the server in the cluster and therefore
   quorum, and Ctrl-C on a client will gracefully leave).
 
 * <a name="start_join"></a><a href="#start_join">`start_join`</a> An array of strings specifying addresses
-  of nodes to [`-join`](#_join) upon startup.
+  of nodes to [`-join`](#_join) upon startup. Note that using
+  <a href="#retry_join">`retry_join`</a> could be more appropriate to help
+  mitigate node startup race conditions when automating a Consul cluster
+  deployment.
 
 * <a name="start_join_wan"></a><a href="#start_join_wan">`start_join_wan`</a> An array of strings specifying
   addresses of WAN nodes to [`-join-wan`](#_join_wan) upon startup.
@@ -764,7 +903,7 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   sends its runtime telemetry, and contains the following keys:
 
   * <a name="telemetry-statsd_address"></a><a href="#telemetry-statsd_address">`statsd_address`</a> This provides the
-    address of a statsd instance in the format `host:port`.  If provided, Consul will send various telemetry information to that instance for
+    address of a statsd instance in the format `host:port`. If provided, Consul will send various telemetry information to that instance for
     aggregation. This can be used to capture runtime information. This sends UDP packets only and can be used with
     statsd or statsite.
 
@@ -811,10 +950,16 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
     Force activation of metrics which already exist and are not currently active. If check management is enabled, the default behavior is to add new metrics as they are encoutered. If the metric already exists in the check, it will **not** be activated. This setting overrides that behavior. By default, this is set to false.
 
   * <a name="telemetry-circonus_check_instance_id"></a><a href="#telemetry-circonus_check_instance_id">`circonus_check_instance_id`</a>
-    Uniquely identifies the metrics coming from this *instance*.  It can be used to maintain metric continuity with transient or ephemeral instances as they move around within an infrastructure. By default, this is set to hostname:application name (e.g. "host123:consul").
+    Uniquely identifies the metrics coming from this *instance*. It can be used to maintain metric continuity with transient or ephemeral instances as they move around within an infrastructure. By default, this is set to hostname:application name (e.g. "host123:consul").
 
   * <a name="telemetry-circonus_check_search_tag"></a><a href="#telemetry-circonus_check_search_tag">`circonus_check_search_tag`</a>
     A special tag which, when coupled with the instance id, helps to narrow down the search results when neither a Submission URL or Check ID is provided. By default, this is set to service:application name (e.g. "service:consul").
+
+  * <a name="telemetry-circonus_check_display_name"</a><a href="#telemetry-circonus_check_display_name">`circonus_check_display_name`</a>
+    Specifies a name to give a check when it is created. This name is displayed in the Circonus UI Checks list. Available in Consul 0.7.2 and later.
+
+  * <a name="telemetry-circonus_check_tags"</a><a href="#telemetry-circonus_check_tags">`circonus_check_tags`</a>
+    Comma separated list of additional tags to add to a check when it is created. Available in Consul 0.7.2 and later.
 
   * <a name="telemetry-circonus_broker_id"></a><a href="#telemetry-circonus_broker_id">`circonus_broker_id`</a>
     The ID of a specific Circonus Broker to use when creating a new check. The numeric portion of `broker._cid` field in a Broker API object. If metric management is enabled and neither a Submission URL nor Check ID is provided, an attempt will be made to search for an existing check using Instance ID and Search Tag. If one is not found, a new HTTPTRAP check will be created. By default, this is not used and a random Enterprise Broker is selected, or the default Circonus Public Broker.
@@ -832,7 +977,7 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   the <a href="#telemetry">telemetry</a> structure
 
 * <a name="dogstatsd_addr"></a><a href="#dogstatsd_addr">`dogstatsd_addr`</a> Deprecated, see
-  he <a href="#telemetry">telemetry</a> structure
+  the <a href="#telemetry">telemetry</a> structure
 
 * <a name="dogstatsd_tags"></a><a href="#dogstatsd_tags">`dogstatsd_tags`</a> Deprecated, see
   the <a href="#telemetry">telemetry</a> structure
@@ -840,6 +985,19 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
 * <a name="syslog_facility"></a><a href="#syslog_facility">`syslog_facility`</a> When
   [`enable_syslog`](#enable_syslog) is provided, this controls to which
   facility messages are sent. By default, `LOCAL0` will be used.
+
+* <a name="tls_min_version"></a><a href="#tls_min_version">`tls_min_version`</a> Added in Consul
+  0.7.4, this specifies the minimum supported version of TLS. Accepted values are "tls10", "tls11"
+  or "tls12". This defaults to "tls10". WARNING: TLS 1.1 and lower are generally considered less
+  secure; avoid using these if possible. This will be changed to default to "tls12" in Consul 0.8.0.
+
+* <a name="tls_cipher_suites"></a><a href="#tls_cipher_suites">`tls_cipher_suites`</a> Added in Consul
+  0.8.2, this specifies the list of supported ciphersuites as a comma-separated-list. The list of all
+  available ciphersuites is available in the [Golang TLS documentation](https://golang.org/src/crypto/tls/cipher_suites.go).
+
+* <a name="tls_prefer_server_cipher_suites"></a><a href="#tls_prefer_server_cipher_suites">
+  `tls_prefer_server_cipher_suites`</a> Added in Consul 0.8.2, this will cause Consul to prefer the
+  server's ciphersuite over the client ciphersuites.
 
 * <a name="translate_wan_addrs"</a><a href="#translate_wan_addrs">`translate_wan_addrs`</a> If
   set to true, Consul will prefer a node's configured <a href="#_advertise-wan">WAN address</a>
@@ -851,29 +1009,29 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   <br>
   Starting in Consul 0.7 and later, node addresses in responses to HTTP requests will also prefer a
   node's configured <a href="#_advertise-wan">WAN address</a> when querying for a node in a remote
-  datacenter. An [`X-Consul-Translate-Addresses`](/docs/agent/http.html#translate_header) header
+  datacenter. An [`X-Consul-Translate-Addresses`](/api/index.html#translate_header) header
   will be present on all responses when translation is enabled to help clients know that the addresses
   may be translated. The `TaggedAddresses` field in responses also have a `lan` address for clients that
   need knowledge of that address, regardless of translation.
   <br>
   <br>The following endpoints translate addresses:
   <br>
-  * [`/v1/catalog/nodes`](/docs/agent/http/catalog.html#catalog_nodes)
-  * [`/v1/catalog/node/<node>`](/docs/agent/http/catalog.html#catalog_node)
-  * [`/v1/catalog/service/<service>`](/docs/agent/http/catalog.html#catalog_service)
-  * [`/v1/health/service/<service>`](/docs/agent/http/health.html#health_service)
-  * [`/v1/query/<query or name>/execute`](/docs/agent/http/query.html#execute)
+  * [`/v1/catalog/nodes`](/api/catalog.html#catalog_nodes)
+  * [`/v1/catalog/node/<node>`](/api/catalog.html#catalog_node)
+  * [`/v1/catalog/service/<service>`](/api/catalog.html#catalog_service)
+  * [`/v1/health/service/<service>`](/api/health.html#health_service)
+  * [`/v1/query/<query or name>/execute`](/api/query.html#execute)
 
 * <a name="ui"></a><a href="#ui">`ui`</a> - Equivalent to the [`-ui`](#_ui)
   command-line flag.
 
 * <a name="ui_dir"></a><a href="#ui_dir">`ui_dir`</a> - Equivalent to the
-  [`-ui-dir`](#_ui_dir) command-line flag.
+  [`-ui-dir`](#_ui_dir) command-line flag. This configuration key is not required as of Consul version 0.7.0 and later. Specifying this configuration key will enable the web UI. There is no need to specify both ui-dir and ui. Specifying both will result in an error.
 
 * <a name="unix_sockets"></a><a href="#unix_sockets">`unix_sockets`</a> - This
   allows tuning the ownership and permissions of the
   Unix domain socket files created by Consul. Domain sockets are only used if
-  the HTTP or RPC addresses are configured with the `unix://` prefix.
+  the HTTP address is configured with the `unix://` prefix.
   <br>
   <br>
   It is important to note that this option may have different effects on
@@ -887,25 +1045,37 @@ Consul will not enable TLS for the HTTP API unless the `https` port has been ass
   sockets created by Consul:
   <br>
   * `user` - The name or ID of the user who will own the socket file.
-  * `group` - The group ID ownership of the socket file. Note that this option
+  * `group` - The group ID ownership of the socket file. This option
     currently only supports numeric IDs.
   * `mode` - The permission bits to set on the file.
 
 * <a name="verify_incoming"></a><a href="#verify_incoming">`verify_incoming`</a> - If
   set to true, Consul requires that all incoming
   connections make use of TLS and that the client provides a certificate signed
-  by the Certificate Authority from the [`ca_file`](#ca_file). By default, this is false, and
-  Consul will not enforce the use of TLS or verify a client's authenticity. This
-  applies to both server RPC and to the HTTPS API. Note: to enable the HTTPS API, you
-  must define an HTTPS port via the [`ports`](#ports) configuration. By default, HTTPS
-  is disabled.
+  by a Certificate Authority from the [`ca_file`](#ca_file) or [`ca_path`](#ca_path).
+  This applies to both server RPC and to the HTTPS API. By default, this is false, and
+  Consul will not enforce the use of TLS or verify a client's authenticity.
+
+* <a name="verify_incoming_rpc"></a><a href="#verify_incoming_rpc">`verify_incoming_rpc`</a> - If
+  set to true, Consul requires that all incoming RPC
+  connections make use of TLS and that the client provides a certificate signed
+  by a Certificate Authority from the [`ca_file`](#ca_file) or [`ca_path`](#ca_path). By default,
+  this is false, and Consul will not enforce the use of TLS or verify a client's authenticity.
+
+* <a name="verify_incoming_https"></a><a href="#verify_incoming_https">`verify_incoming_https`</a> - If
+  set to true, Consul requires that all incoming HTTPS
+  connections make use of TLS and that the client provides a certificate signed
+  by a Certificate Authority from the [`ca_file`](#ca_file) or [`ca_path`](#ca_path). By default,
+  this is false, and Consul will not enforce the use of TLS or verify a client's authenticity. To
+  enable the HTTPS API, you must define an HTTPS port via the [`ports`](#ports) configuration. By
+  default, HTTPS is disabled.
 
 * <a name="verify_outgoing"></a><a href="#verify_outgoing">`verify_outgoing`</a> - If set to
   true, Consul requires that all outgoing connections
   make use of TLS and that the server provides a certificate that is signed by
-  the Certificate Authority from the [`ca_file`](#ca_file). By default, this is false, and Consul
-  will not make use of TLS for outgoing connections. This applies to clients and servers
-  as both will make outgoing connections.
+  a Certificate Authority from the [`ca_file`](#ca_file) or [`ca_path`](#ca_path). By default,
+  this is false, and Consul will not make use of TLS for outgoing connections. This applies to clients
+  and servers as both will make outgoing connections.
 
 * <a name="verify_server_hostname"></a><a href="#verify_server_hostname">`verify_server_hostname`</a> - If set to
   true, Consul verifies for all outgoing connections that the TLS certificate presented by the servers
@@ -937,16 +1107,14 @@ port.
   WAN to other servers. TCP and UDP.
 
 * CLI RPC (Default 8400). This is used by all agents to handle RPC
-  from the CLI. TCP only.
+  from the CLI, but is deprecated in Consul 0.8 and later. TCP only.
+  In Consul 0.8 all CLI commands were changed to use the HTTP API and
+  the RPC interface was completely removed.
 
 * HTTP API (Default 8500). This is used by clients to talk to the HTTP
   API. TCP only.
 
 * DNS Interface (Default 8600). Used to resolve DNS queries. TCP and UDP.
-
-Consul will also make an outgoing connection to HashiCorp's servers for
-Atlas-related features and to check for the availability of newer versions
-of Consul. This will be a TLS-secured TCP connection to `scada.hashicorp.com:7223`.
 
 ## <a id="reloadable-configuration"></a>Reloadable Configuration
 
@@ -958,6 +1126,4 @@ items which are reloaded include:
 * Services
 * Watches
 * HTTP Client Address
-* Atlas Token
-* Atlas Infrastructure
-* Atlas Endpoint
+* <a href="#node_meta">Node Metadata</a>

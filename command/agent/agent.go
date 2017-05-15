@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"crypto/sha512"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,17 +14,23 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/logger"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-sockaddr/template"
 	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/coordinate"
 	"github.com/hashicorp/serf/serf"
+	"github.com/shirou/gopsutil/host"
 )
 
 const (
@@ -32,10 +40,6 @@ const (
 	// Path to save local agent checks
 	checksDir     = "checks"
 	checkStateDir = "checks/state"
-
-	// The ID of the faux health checks for maintenance mode
-	serviceMaintCheckPrefix = "_service_maintenance"
-	nodeMaintCheckID        = "_node_maintenance"
 
 	// Default reasons for node/service maintenance mode
 	defaultNodeMaintReason = "Maintenance mode is enabled for this node, " +
@@ -66,10 +70,16 @@ type Agent struct {
 	// Output sink for logs
 	logOutput io.Writer
 
+	// Used for streaming logs to
+	logWriter *logger.LogWriter
+
 	// We have one of a client or a server, depending
 	// on our configuration
 	server *consul.Server
 	client *consul.Client
+
+	// acls is an object that helps manage local ACL enforcement.
+	acls *aclManager
 
 	// state stores a local representation of the node,
 	// services and checks. Used for anti-entropy.
@@ -109,6 +119,8 @@ type Agent struct {
 	eventLock   sync.RWMutex
 	eventNotify state.NotifyGroup
 
+	reloadCh chan chan error
+
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
@@ -121,7 +133,7 @@ type Agent struct {
 
 // Create is used to create a new Agent. Returns
 // the agent or potentially an error.
-func Create(config *Config, logOutput io.Writer) (*Agent, error) {
+func Create(config *Config, logOutput io.Writer, logWriter *logger.LogWriter, reloadCh chan chan error) (*Agent, error) {
 	// Ensure we have a log sink
 	if logOutput == nil {
 		logOutput = os.Stderr
@@ -135,46 +147,11 @@ func Create(config *Config, logOutput io.Writer) (*Agent, error) {
 		return nil, fmt.Errorf("Must configure a DataDir")
 	}
 
-	// Try to get an advertise address
-	if config.AdvertiseAddr != "" {
-		if ip := net.ParseIP(config.AdvertiseAddr); ip == nil {
-			return nil, fmt.Errorf("Failed to parse advertise address: %v", config.AdvertiseAddr)
-		}
-	} else if config.BindAddr != "0.0.0.0" && config.BindAddr != "" && config.BindAddr != "[::]" {
-		config.AdvertiseAddr = config.BindAddr
-	} else {
-		var err error
-		var ip net.IP
-		if config.BindAddr == "[::]" {
-			ip, err = consul.GetPublicIPv6()
-		} else {
-			ip, err = consul.GetPrivateIP()
-		}
-		if err != nil {
-			return nil, fmt.Errorf("Failed to get advertise address: %v", err)
-		}
-		config.AdvertiseAddr = ip.String()
-	}
-
-	// Try to get an advertise address for the wan
-	if config.AdvertiseAddrWan != "" {
-		if ip := net.ParseIP(config.AdvertiseAddrWan); ip == nil {
-			return nil, fmt.Errorf("Failed to parse advertise address for wan: %v", config.AdvertiseAddrWan)
-		}
-	} else {
-		config.AdvertiseAddrWan = config.AdvertiseAddr
-	}
-
-	// Create the default set of tagged addresses.
-	config.TaggedAddresses = map[string]string{
-		"lan": config.AdvertiseAddr,
-		"wan": config.AdvertiseAddrWan,
-	}
-
 	agent := &Agent{
 		config:         config,
 		logger:         log.New(logOutput, "", log.LstdFlags),
 		logOutput:      logOutput,
+		logWriter:      logWriter,
 		checkReapAfter: make(map[types.CheckID]time.Duration),
 		checkMonitors:  make(map[types.CheckID]*CheckMonitor),
 		checkTTLs:      make(map[types.CheckID]*CheckTTL),
@@ -183,15 +160,31 @@ func Create(config *Config, logOutput io.Writer) (*Agent, error) {
 		checkDockers:   make(map[types.CheckID]*CheckDocker),
 		eventCh:        make(chan serf.UserEvent, 1024),
 		eventBuf:       make([]*UserEvent, 256),
+		reloadCh:       reloadCh,
 		shutdownCh:     make(chan struct{}),
 		endpoints:      make(map[string]string),
+	}
+	if err := agent.resolveTmplAddrs(); err != nil {
+		return nil, err
+	}
+
+	// Initialize the ACL manager.
+	acls, err := newACLManager(config)
+	if err != nil {
+		return nil, err
+	}
+	agent.acls = acls
+
+	// Retrieve or generate the node ID before setting up the rest of the
+	// agent, which depends on it.
+	if err := agent.setupNodeID(config); err != nil {
+		return nil, fmt.Errorf("Failed to setup node ID: %v", err)
 	}
 
 	// Initialize the local state.
 	agent.state.Init(config, agent.logger)
 
 	// Setup either the client or the server.
-	var err error
 	if config.Server {
 		err = agent.setupServer()
 		agent.state.SetIface(agent.server)
@@ -203,7 +196,8 @@ func Create(config *Config, logOutput io.Writer) (*Agent, error) {
 			Port:    agent.config.Ports.Server,
 			Tags:    []string{},
 		}
-		agent.state.AddService(&consulService, "")
+
+		agent.state.AddService(&consulService, agent.config.GetTokenForAgent())
 	} else {
 		err = agent.setupClient()
 		agent.state.SetIface(agent.client)
@@ -212,11 +206,14 @@ func Create(config *Config, logOutput io.Writer) (*Agent, error) {
 		return nil, err
 	}
 
-	// Load checks/services.
+	// Load checks/services/metadata.
 	if err := agent.loadServices(config); err != nil {
 		return nil, err
 	}
 	if err := agent.loadChecks(config); err != nil {
+		return nil, err
+	}
+	if err := agent.loadMetadata(config); err != nil {
 		return nil, err
 	}
 
@@ -242,14 +239,15 @@ func Create(config *Config, logOutput io.Writer) (*Agent, error) {
 }
 
 // consulConfig is used to return a consul configuration
-func (a *Agent) consulConfig() *consul.Config {
+func (a *Agent) consulConfig() (*consul.Config, error) {
 	// Start with the provided config or default config
-	var base *consul.Config
+	base := consul.DefaultConfig()
 	if a.config.ConsulConfig != nil {
 		base = a.config.ConsulConfig
-	} else {
-		base = consul.DefaultConfig()
 	}
+
+	// This is set when the agent starts up
+	base.NodeID = a.config.NodeID
 
 	// Apply dev mode
 	base.DevMode = a.config.DevMode
@@ -295,12 +293,57 @@ func (a *Agent) consulConfig() *consul.Config {
 	if a.config.SerfWanBindAddr != "" {
 		base.SerfWANConfig.MemberlistConfig.BindAddr = a.config.SerfWanBindAddr
 	}
+	// Try to get an advertise address
+	switch {
+	case a.config.AdvertiseAddr != "":
+		ipStr, err := parseSingleIPTemplate(a.config.AdvertiseAddr)
+		if err != nil {
+			return nil, fmt.Errorf("Advertise address resolution failed: %v", err)
+		}
+		if net.ParseIP(ipStr) == nil {
+			return nil, fmt.Errorf("Failed to parse advertise address: %v", ipStr)
+		}
+		a.config.AdvertiseAddr = ipStr
+
+	case a.config.BindAddr != "" && !isAddrANY(a.config.BindAddr):
+		a.config.AdvertiseAddr = a.config.BindAddr
+
+	default:
+		ip, err := consul.GetPrivateIP()
+		if a.config.BindAddr == "[::]" {
+			ip, err = consul.GetPublicIPv6()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Failed to get advertise address: %v", err)
+		}
+		a.config.AdvertiseAddr = ip.String()
+	}
+
+	// Try to get an advertise address for the wan
+	if a.config.AdvertiseAddrWan != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.AdvertiseAddrWan)
+		if err != nil {
+			return nil, fmt.Errorf("Advertise WAN address resolution failed: %v", err)
+		}
+		if net.ParseIP(ipStr) == nil {
+			return nil, fmt.Errorf("Failed to parse advertise address for WAN: %v", ipStr)
+		}
+		a.config.AdvertiseAddrWan = ipStr
+	} else {
+		a.config.AdvertiseAddrWan = a.config.AdvertiseAddr
+	}
+
+	// Create the default set of tagged addresses.
+	a.config.TaggedAddresses = map[string]string{
+		"lan": a.config.AdvertiseAddr,
+		"wan": a.config.AdvertiseAddrWan,
+	}
+
 	if a.config.AdvertiseAddr != "" {
 		base.SerfLANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddr
+		base.SerfWANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddr
 		if a.config.AdvertiseAddrWan != "" {
 			base.SerfWANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddrWan
-		} else {
-			base.SerfWANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddr
 		}
 		base.RPCAdvertise = &net.TCPAddr{
 			IP:   net.ParseIP(a.config.AdvertiseAddr),
@@ -336,8 +379,14 @@ func (a *Agent) consulConfig() *consul.Config {
 	if a.config.Protocol > 0 {
 		base.ProtocolVersion = uint8(a.config.Protocol)
 	}
+	if a.config.RaftProtocol != 0 {
+		base.RaftConfig.ProtocolVersion = raft.ProtocolVersion(a.config.RaftProtocol)
+	}
 	if a.config.ACLToken != "" {
 		base.ACLToken = a.config.ACLToken
+	}
+	if a.config.ACLAgentToken != "" {
+		base.ACLAgentToken = a.config.ACLAgentToken
 	}
 	if a.config.ACLMasterToken != "" {
 		base.ACLMasterToken = a.config.ACLMasterToken
@@ -357,8 +406,43 @@ func (a *Agent) consulConfig() *consul.Config {
 	if a.config.ACLReplicationToken != "" {
 		base.ACLReplicationToken = a.config.ACLReplicationToken
 	}
+	if a.config.ACLEnforceVersion8 != nil {
+		base.ACLEnforceVersion8 = *a.config.ACLEnforceVersion8
+	}
 	if a.config.SessionTTLMinRaw != "" {
 		base.SessionTTLMin = a.config.SessionTTLMin
+	}
+	if a.config.Autopilot.CleanupDeadServers != nil {
+		base.AutopilotConfig.CleanupDeadServers = *a.config.Autopilot.CleanupDeadServers
+	}
+	if a.config.Autopilot.LastContactThreshold != nil {
+		base.AutopilotConfig.LastContactThreshold = *a.config.Autopilot.LastContactThreshold
+	}
+	if a.config.Autopilot.MaxTrailingLogs != nil {
+		base.AutopilotConfig.MaxTrailingLogs = *a.config.Autopilot.MaxTrailingLogs
+	}
+	if a.config.Autopilot.ServerStabilizationTime != nil {
+		base.AutopilotConfig.ServerStabilizationTime = *a.config.Autopilot.ServerStabilizationTime
+	}
+	if a.config.NonVotingServer {
+		base.NonVoter = a.config.NonVotingServer
+	}
+	if a.config.Autopilot.RedundancyZoneTag != "" {
+		base.AutopilotConfig.RedundancyZoneTag = a.config.Autopilot.RedundancyZoneTag
+	}
+	if a.config.Autopilot.DisableUpgradeMigration != nil {
+		base.AutopilotConfig.DisableUpgradeMigration = *a.config.Autopilot.DisableUpgradeMigration
+	}
+
+	// make sure the advertise address is always set
+	if base.RPCAdvertise == nil {
+		base.RPCAdvertise = base.RPCAddr
+	}
+
+	// set the src address for outgoing rpc connections
+	// Use port 0 so that outgoing connections use a random port.
+	if !isAddrANY(base.RPCAddr.IP) {
+		base.RPCSrcAddr = &net.TCPAddr{IP: base.RPCAddr.IP}
 	}
 
 	// Format the build string
@@ -366,18 +450,21 @@ func (a *Agent) consulConfig() *consul.Config {
 	if len(revision) > 8 {
 		revision = revision[:8]
 	}
-	base.Build = fmt.Sprintf("%s%s:%s",
-		a.config.Version, a.config.VersionPrerelease, revision)
+	base.Build = fmt.Sprintf("%s%s:%s", a.config.Version, a.config.VersionPrerelease, revision)
 
 	// Copy the TLS configuration
-	base.VerifyIncoming = a.config.VerifyIncoming
+	base.VerifyIncoming = a.config.VerifyIncoming || a.config.VerifyIncomingRPC
 	base.VerifyOutgoing = a.config.VerifyOutgoing
 	base.VerifyServerHostname = a.config.VerifyServerHostname
 	base.CAFile = a.config.CAFile
+	base.CAPath = a.config.CAPath
 	base.CertFile = a.config.CertFile
 	base.KeyFile = a.config.KeyFile
 	base.ServerName = a.config.ServerName
 	base.Domain = a.config.Domain
+	base.TLSMinVersion = a.config.TLSMinVersion
+	base.TLSCipherSuites = a.config.TLSCipherSuites
+	base.TLSPreferServerCipherSuites = a.config.TLSPreferServerCipherSuites
 
 	// Setup the ServerUp callback
 	base.ServerUp = a.state.ConsulServerUp
@@ -392,17 +479,125 @@ func (a *Agent) consulConfig() *consul.Config {
 
 	// Setup the loggers
 	base.LogOutput = a.logOutput
-	return base
+	return base, nil
+}
+
+// parseSingleIPTemplate is used as a helper function to parse out a single IP
+// address from a config parameter.
+func parseSingleIPTemplate(ipTmpl string) (string, error) {
+	out, err := template.Parse(ipTmpl)
+	if err != nil {
+		return "", fmt.Errorf("Unable to parse address template %q: %v", ipTmpl, err)
+	}
+
+	ips := strings.Split(out, " ")
+	switch len(ips) {
+	case 0:
+		return "", errors.New("No addresses found, please configure one.")
+	case 1:
+		return ips[0], nil
+	default:
+		return "", fmt.Errorf("Multiple addresses found (%q), please configure one.", out)
+	}
+}
+
+// resolveTmplAddrs iterates over the myriad of addresses in the agent's config
+// and performs go-sockaddr/template Parse on each known address in case the
+// user specified a template config for any of their values.
+func (a *Agent) resolveTmplAddrs() error {
+	if a.config.AdvertiseAddr != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.AdvertiseAddr)
+		if err != nil {
+			return fmt.Errorf("Advertise address resolution failed: %v", err)
+		}
+		a.config.AdvertiseAddr = ipStr
+	}
+
+	if a.config.Addresses.DNS != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.Addresses.DNS)
+		if err != nil {
+			return fmt.Errorf("DNS address resolution failed: %v", err)
+		}
+		a.config.Addresses.DNS = ipStr
+	}
+
+	if a.config.Addresses.HTTP != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.Addresses.HTTP)
+		if err != nil {
+			return fmt.Errorf("HTTP address resolution failed: %v", err)
+		}
+		a.config.Addresses.HTTP = ipStr
+	}
+
+	if a.config.Addresses.HTTPS != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.Addresses.HTTPS)
+		if err != nil {
+			return fmt.Errorf("HTTPS address resolution failed: %v", err)
+		}
+		a.config.Addresses.HTTPS = ipStr
+	}
+
+	if a.config.AdvertiseAddrWan != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.AdvertiseAddrWan)
+		if err != nil {
+			return fmt.Errorf("Advertise WAN address resolution failed: %v", err)
+		}
+		a.config.AdvertiseAddrWan = ipStr
+	}
+
+	if a.config.BindAddr != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.BindAddr)
+		if err != nil {
+			return fmt.Errorf("Bind address resolution failed: %v", err)
+		}
+		a.config.BindAddr = ipStr
+	}
+
+	if a.config.ClientAddr != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.ClientAddr)
+		if err != nil {
+			return fmt.Errorf("Client address resolution failed: %v", err)
+		}
+		a.config.ClientAddr = ipStr
+	}
+
+	if a.config.SerfLanBindAddr != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.SerfLanBindAddr)
+		if err != nil {
+			return fmt.Errorf("Serf LAN Address resolution failed: %v", err)
+		}
+		a.config.SerfLanBindAddr = ipStr
+	}
+
+	if a.config.SerfWanBindAddr != "" {
+		ipStr, err := parseSingleIPTemplate(a.config.SerfWanBindAddr)
+		if err != nil {
+			return fmt.Errorf("Serf WAN Address resolution failed: %v", err)
+		}
+		a.config.SerfWanBindAddr = ipStr
+	}
+
+	// Parse all tagged addresses
+	for k, v := range a.config.TaggedAddresses {
+		ipStr, err := parseSingleIPTemplate(v)
+		if err != nil {
+			return fmt.Errorf("%s address resolution failed: %v", k, err)
+		}
+		a.config.TaggedAddresses[k] = ipStr
+	}
+
+	return nil
 }
 
 // setupServer is used to initialize the Consul server
 func (a *Agent) setupServer() error {
-	config := a.consulConfig()
-
+	config, err := a.consulConfig()
+	if err != nil {
+		return err
+	}
 	if err := a.setupKeyrings(config); err != nil {
 		return fmt.Errorf("Failed to configure keyring: %v", err)
 	}
-
 	server, err := consul.NewServer(config)
 	if err != nil {
 		return fmt.Errorf("Failed to start Consul server: %v", err)
@@ -413,17 +608,132 @@ func (a *Agent) setupServer() error {
 
 // setupClient is used to initialize the Consul client
 func (a *Agent) setupClient() error {
-	config := a.consulConfig()
-
+	config, err := a.consulConfig()
+	if err != nil {
+		return err
+	}
 	if err := a.setupKeyrings(config); err != nil {
 		return fmt.Errorf("Failed to configure keyring: %v", err)
 	}
-
 	client, err := consul.NewClient(config)
 	if err != nil {
 		return fmt.Errorf("Failed to start Consul client: %v", err)
 	}
 	a.client = client
+	return nil
+}
+
+// makeRandomID will generate a random UUID for a node.
+func (a *Agent) makeRandomID() (string, error) {
+	id, err := uuid.GenerateUUID()
+	if err != nil {
+		return "", err
+	}
+
+	a.logger.Printf("[DEBUG] Using random ID %q as node ID", id)
+	return id, nil
+}
+
+// makeNodeID will try to find a host-specific ID, or else will generate a
+// random ID. The returned ID will always be formatted as a GUID. We don't tell
+// the caller whether this ID is random or stable since the consequences are
+// high for us if this changes, so we will persist it either way. This will let
+// gopsutil change implementations without affecting in-place upgrades of nodes.
+func (a *Agent) makeNodeID() (string, error) {
+	// If they've disabled host-based IDs then just make a random one.
+	if a.config.DisableHostNodeID {
+		return a.makeRandomID()
+	}
+
+	// Try to get a stable ID associated with the host itself.
+	info, err := host.Info()
+	if err != nil {
+		a.logger.Printf("[DEBUG] Couldn't get a unique ID from the host: %v", err)
+		return a.makeRandomID()
+	}
+
+	// Make sure the host ID parses as a UUID, since we don't have complete
+	// control over this process.
+	id := strings.ToLower(info.HostID)
+	if _, err := uuid.ParseUUID(id); err != nil {
+		a.logger.Printf("[DEBUG] Unique ID %q from host isn't formatted as a UUID: %v",
+			id, err)
+		return a.makeRandomID()
+	}
+
+	// Hash the input to make it well distributed. The reported Host UUID may be
+	// similar across nodes if they are on a cloud provider or on motherboards
+	// created from the same batch.
+	buf := sha512.Sum512([]byte(id))
+	id = fmt.Sprintf("%08x-%04x-%04x-%04x-%12x",
+		buf[0:4],
+		buf[4:6],
+		buf[6:8],
+		buf[8:10],
+		buf[10:16])
+
+	a.logger.Printf("[DEBUG] Using unique ID %q from host as node ID", id)
+	return id, nil
+}
+
+// setupNodeID will pull the persisted node ID, if any, or create a random one
+// and persist it.
+func (a *Agent) setupNodeID(config *Config) error {
+	// If they've configured a node ID manually then just use that, as
+	// long as it's valid.
+	if config.NodeID != "" {
+		config.NodeID = types.NodeID(strings.ToLower(string(config.NodeID)))
+		if _, err := uuid.ParseUUID(string(config.NodeID)); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// For dev mode we have no filesystem access so just make one.
+	if a.config.DevMode {
+		id, err := a.makeNodeID()
+		if err != nil {
+			return err
+		}
+
+		config.NodeID = types.NodeID(id)
+		return nil
+	}
+
+	// Load saved state, if any. Since a user could edit this, we also
+	// validate it.
+	fileID := filepath.Join(config.DataDir, "node-id")
+	if _, err := os.Stat(fileID); err == nil {
+		rawID, err := ioutil.ReadFile(fileID)
+		if err != nil {
+			return err
+		}
+
+		nodeID := strings.TrimSpace(string(rawID))
+		nodeID = strings.ToLower(nodeID)
+		if _, err := uuid.ParseUUID(nodeID); err != nil {
+			return err
+		}
+
+		config.NodeID = types.NodeID(nodeID)
+	}
+
+	// If we still don't have a valid node ID, make one.
+	if config.NodeID == "" {
+		id, err := a.makeNodeID()
+		if err != nil {
+			return err
+		}
+		if err := lib.EnsurePath(fileID, false); err != nil {
+			return err
+		}
+		if err := ioutil.WriteFile(fileID, []byte(id), 0600); err != nil {
+			return err
+		}
+
+		config.NodeID = types.NodeID(id)
+	}
 	return nil
 }
 
@@ -494,9 +804,8 @@ func (a *Agent) SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.
 func (a *Agent) Leave() error {
 	if a.server != nil {
 		return a.server.Leave()
-	} else {
-		return a.client.Leave()
 	}
+	return a.client.Leave()
 }
 
 // Shutdown is used to hard stop the agent. Should be
@@ -594,27 +903,24 @@ func (a *Agent) ForceLeave(node string) (err error) {
 func (a *Agent) LocalMember() serf.Member {
 	if a.server != nil {
 		return a.server.LocalMember()
-	} else {
-		return a.client.LocalMember()
 	}
+	return a.client.LocalMember()
 }
 
 // LANMembers is used to retrieve the LAN members
 func (a *Agent) LANMembers() []serf.Member {
 	if a.server != nil {
 		return a.server.LANMembers()
-	} else {
-		return a.client.LANMembers()
 	}
+	return a.client.LANMembers()
 }
 
 // WANMembers is used to retrieve the WAN members
 func (a *Agent) WANMembers() []serf.Member {
 	if a.server != nil {
 		return a.server.WANMembers()
-	} else {
-		return nil
 	}
+	return nil
 }
 
 // StartSync is called once Services and Checks are registered.
@@ -639,9 +945,8 @@ func (a *Agent) ResumeSync() {
 func (a *Agent) GetCoordinate() (*coordinate.Coordinate, error) {
 	if a.config.Server {
 		return a.server.GetLANCoordinate()
-	} else {
-		return a.client.GetCoordinate()
 	}
+	return a.client.GetCoordinate()
 }
 
 // sendCoordinate is a long-running loop that periodically sends our coordinate
@@ -672,14 +977,11 @@ func (a *Agent) sendCoordinate() {
 				continue
 			}
 
-			// TODO - Consider adding a distance check so we don't send
-			// an update if the position hasn't changed by more than a
-			// threshold.
 			req := structs.CoordinateUpdateRequest{
 				Datacenter:   a.config.Datacenter,
 				Node:         a.config.NodeName,
 				Coord:        c,
-				WriteRequest: structs.WriteRequest{Token: a.config.ACLToken},
+				WriteRequest: structs.WriteRequest{Token: a.config.GetTokenForAgent()},
 			}
 			var reply struct{}
 			if err := a.RPC("Coordinate.Update", &req, &reply); err != nil {
@@ -881,7 +1183,7 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes CheckTypes, pe
 			Node:        a.config.NodeName,
 			CheckID:     types.CheckID(checkID),
 			Name:        fmt.Sprintf("Service '%s' check", service.Service),
-			Status:      structs.HealthCritical,
+			Status:      api.HealthCritical,
 			Notes:       chkType.Notes,
 			ServiceID:   service.ID,
 			ServiceName: service.Service,
@@ -912,11 +1214,7 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 	}
 
 	// Remove service immediately
-	err := a.state.RemoveService(serviceID)
-
-	// TODO: Return the error instead of just logging here in Consul 0.8
-	// For now, keep the current idempotent behavior on deleting a nonexistent service
-	if err != nil {
+	if err := a.state.RemoveService(serviceID); err != nil {
 		a.logger.Printf("[WARN] agent: Failed to deregister service %q: %s", serviceID, err)
 		return nil
 	}
@@ -1480,7 +1778,7 @@ func (a *Agent) loadChecks(conf *Config) error {
 		} else {
 			// Default check to critical to avoid placing potentially unhealthy
 			// services into the active pool
-			p.Check.Status = structs.HealthCritical
+			p.Check.Status = api.HealthCritical
 
 			if err := a.AddCheck(p.Check, p.ChkType, false, p.Token); err != nil {
 				// Purge the check if it is unable to be restored.
@@ -1525,9 +1823,41 @@ func (a *Agent) restoreCheckState(snap map[types.CheckID]*structs.HealthCheck) {
 	}
 }
 
+// loadMetadata loads node metadata fields from the agent config and
+// updates them on the local agent.
+func (a *Agent) loadMetadata(conf *Config) error {
+	a.state.Lock()
+	defer a.state.Unlock()
+
+	for key, value := range conf.Meta {
+		a.state.metadata[key] = value
+	}
+
+	a.state.changeMade()
+
+	return nil
+}
+
+// parseMetaPair parses a key/value pair of the form key:value
+func parseMetaPair(raw string) (string, string) {
+	pair := strings.SplitN(raw, ":", 2)
+	if len(pair) == 2 {
+		return pair[0], pair[1]
+	}
+	return pair[0], ""
+}
+
+// unloadMetadata resets the local metadata state
+func (a *Agent) unloadMetadata() {
+	a.state.Lock()
+	defer a.state.Unlock()
+
+	a.state.metadata = make(map[string]string)
+}
+
 // serviceMaintCheckID returns the ID of a given service's maintenance check
 func serviceMaintCheckID(serviceID string) types.CheckID {
-	return types.CheckID(fmt.Sprintf("%s:%s", serviceMaintCheckPrefix, serviceID))
+	return types.CheckID(structs.ServiceMaintPrefix + serviceID)
 }
 
 // EnableServiceMaintenance will register a false health check against the given
@@ -1557,7 +1887,7 @@ func (a *Agent) EnableServiceMaintenance(serviceID, reason, token string) error 
 		Notes:       reason,
 		ServiceID:   service.ID,
 		ServiceName: service.Service,
-		Status:      structs.HealthCritical,
+		Status:      api.HealthCritical,
 	}
 	a.AddCheck(check, nil, true, token)
 	a.logger.Printf("[INFO] agent: Service %q entered maintenance mode", serviceID)
@@ -1588,7 +1918,7 @@ func (a *Agent) DisableServiceMaintenance(serviceID string) error {
 // EnableNodeMaintenance places a node into maintenance mode.
 func (a *Agent) EnableNodeMaintenance(reason, token string) {
 	// Ensure node maintenance is not already enabled
-	if _, ok := a.state.Checks()[nodeMaintCheckID]; ok {
+	if _, ok := a.state.Checks()[structs.NodeMaint]; ok {
 		return
 	}
 
@@ -1600,10 +1930,10 @@ func (a *Agent) EnableNodeMaintenance(reason, token string) {
 	// Create and register the node maintenance check
 	check := &structs.HealthCheck{
 		Node:    a.config.NodeName,
-		CheckID: nodeMaintCheckID,
+		CheckID: structs.NodeMaint,
 		Name:    "Node Maintenance Mode",
 		Notes:   reason,
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	a.AddCheck(check, nil, true, token)
 	a.logger.Printf("[INFO] agent: Node entered maintenance mode")
@@ -1611,10 +1941,10 @@ func (a *Agent) EnableNodeMaintenance(reason, token string) {
 
 // DisableNodeMaintenance removes a node from maintenance mode
 func (a *Agent) DisableNodeMaintenance() {
-	if _, ok := a.state.Checks()[nodeMaintCheckID]; !ok {
+	if _, ok := a.state.Checks()[structs.NodeMaint]; !ok {
 		return
 	}
-	a.RemoveCheck(nodeMaintCheckID, true)
+	a.RemoveCheck(structs.NodeMaint, true)
 	a.logger.Printf("[INFO] agent: Node left maintenance mode")
 }
 

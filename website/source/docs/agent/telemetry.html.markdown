@@ -161,7 +161,7 @@ These metrics give insight into the health of the cluster as a whole.
   </tr>
   <tr>
     <td>`consul.serf.events`</td>
-    <td>This increments when an agent processes an [event](/docs/commands/event.html). Note that Consul uses events internally so there may be additional events showing in telemetry. There are also a per-event counters emitted as `consul.serf.events.<event name>`.</td>
+    <td>This increments when an agent processes an [event](/docs/commands/event.html). Consul uses events internally so there may be additional events showing in telemetry. There are also a per-event counters emitted as `consul.serf.events.<event name>`.</td>
     <td>events / interval</td>
     <td>counter</td>
   </tr>
@@ -185,8 +185,20 @@ These metrics give insight into the health of the cluster as a whole.
   </tr>
   <tr>
     <td>`consul.http.<verb>.<path>`</td>
-    <td>This tracks how long it takes to service the given HTTP request for the given verb and path. Note that paths do not include details like service or key names, for these an underscore will be present as a placeholder (eg. `consul.http.GET.v1.kv._`)</td>
+    <td>This tracks how long it takes to service the given HTTP request for the given verb and path. Paths do not include details like service or key names, for these an underscore will be present as a placeholder (eg. `consul.http.GET.v1.kv._`)</td>
     <td>ms</td>
     <td>timer</td>
+  </tr>
+  <tr>
+    <td>`consul.autopilot.failure_tolerance`</td>
+    <td>This tracks the number of voting servers that the cluster can lose while continuing to function.</td>
+    <td>servers</td>
+    <td>gauge</td>
+  </tr>
+  <tr>
+    <td>`consul.autopilot.healthy`</td>
+    <td>This tracks the overall health of the local server cluster. If all servers are considered healthy by Autopilot, this will be set to 1. If any are unhealthy, this will be 0.</td>
+    <td>boolean</td>
+    <td>gauge</td>
   </tr>
 </table>

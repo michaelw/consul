@@ -1,19 +1,27 @@
 package agent
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/consul/logger"
-	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/command/base"
+	"github.com/hashicorp/consul/testutil/retry"
+	"github.com/hashicorp/consul/version"
 	"github.com/mitchellh/cli"
 )
+
+func baseCommand(ui *cli.MockUi) base.Command {
+	return base.Command{
+		Flags: base.FlagSetNone,
+		UI:    ui,
+	}
+}
 
 func TestCommand_implements(t *testing.T) {
 	var _ cli.Command = new(Command)
@@ -63,8 +71,9 @@ func TestRetryJoin(t *testing.T) {
 	}()
 
 	cmd := &Command{
+		Version:    version.Version,
 		ShutdownCh: shutdownCh,
-		Ui:         new(cli.MockUi),
+		Command:    baseCommand(new(cli.MockUi)),
 	}
 
 	serfAddr := fmt.Sprintf(
@@ -94,19 +103,13 @@ func TestRetryJoin(t *testing.T) {
 		}
 		close(doneCh)
 	}()
-
-	testutil.WaitForResult(func() (bool, error) {
-		mem := agent.LANMembers()
-		if len(mem) != 2 {
-			return false, fmt.Errorf("bad: %#v", mem)
+	retry.Run(t, func(r *retry.R) {
+		if got, want := len(agent.LANMembers()), 2; got != want {
+			r.Fatalf("got %d LAN members want %d", got, want)
 		}
-		mem = agent.WANMembers()
-		if len(mem) != 2 {
-			return false, fmt.Errorf("bad (wan): %#v", mem)
+		if got, want := len(agent.WANMembers()), 2; got != want {
+			r.Fatalf("got %d WAN members want %d", got, want)
 		}
-		return true, nil
-	}, func(err error) {
-		t.Fatalf(err.Error())
 	})
 }
 
@@ -129,9 +132,10 @@ func TestReadCliConfig(t *testing.T) {
 				"-advertise-wan", "1.2.3.4",
 				"-serf-wan-bind", "4.3.2.1",
 				"-serf-lan-bind", "4.3.2.2",
+				"-node-meta", "somekey:somevalue",
 			},
 			ShutdownCh: shutdownCh,
-			Ui:         new(cli.MockUi),
+			Command:    baseCommand(new(cli.MockUi)),
 		}
 
 		config := cmd.readConfig()
@@ -143,6 +147,30 @@ func TestReadCliConfig(t *testing.T) {
 		}
 		if config.SerfLanBindAddr != "4.3.2.2" {
 			t.Fatalf("expected -serf-lan-bind 4.3.2.2 got %s", config.SerfLanBindAddr)
+		}
+		if len(config.Meta) != 1 || config.Meta["somekey"] != "somevalue" {
+			t.Fatalf("expected somekey=somevalue, got %v", config.Meta)
+		}
+	}
+
+	// Test multiple node meta flags
+	{
+		cmd := &Command{
+			args: []string{
+				"-data-dir", tmpDir,
+				"-node-meta", "somekey:somevalue",
+				"-node-meta", "otherkey:othervalue",
+			},
+			ShutdownCh: shutdownCh,
+			Command:    baseCommand(new(cli.MockUi)),
+		}
+		expected := map[string]string{
+			"somekey":  "somevalue",
+			"otherkey": "othervalue",
+		}
+		config := cmd.readConfig()
+		if !reflect.DeepEqual(config.Meta, expected) {
+			t.Fatalf("bad: %v %v", config.Meta, expected)
 		}
 	}
 
@@ -156,7 +184,7 @@ func TestReadCliConfig(t *testing.T) {
 				"-data-dir", tmpDir,
 			},
 			ShutdownCh: shutdownCh,
-			Ui:         ui,
+			Command:    baseCommand(ui),
 		}
 
 		config := cmd.readConfig()
@@ -183,7 +211,7 @@ func TestReadCliConfig(t *testing.T) {
 				"-node", `"client"`,
 			},
 			ShutdownCh: shutdownCh,
-			Ui:         ui,
+			Command:    baseCommand(ui),
 		}
 
 		config := cmd.readConfig()
@@ -206,7 +234,7 @@ func TestReadCliConfig(t *testing.T) {
 		cmd := &Command{
 			args:       []string{"-node", `""`},
 			ShutdownCh: shutdownCh,
-			Ui:         new(cli.MockUi),
+			Command:    baseCommand(new(cli.MockUi)),
 		}
 
 		config := cmd.readConfig()
@@ -229,7 +257,7 @@ func TestRetryJoinFail(t *testing.T) {
 
 	cmd := &Command{
 		ShutdownCh: shutdownCh,
-		Ui:         new(cli.MockUi),
+		Command:    baseCommand(new(cli.MockUi)),
 	}
 
 	serfAddr := fmt.Sprintf("%s:%d", conf.BindAddr, conf.Ports.SerfLan)
@@ -238,6 +266,7 @@ func TestRetryJoinFail(t *testing.T) {
 		"-data-dir", tmpDir,
 		"-retry-join", serfAddr,
 		"-retry-max", "1",
+		"-retry-interval", "10ms",
 	}
 
 	if code := cmd.Run(args); code == 0 {
@@ -258,7 +287,7 @@ func TestRetryJoinWanFail(t *testing.T) {
 
 	cmd := &Command{
 		ShutdownCh: shutdownCh,
-		Ui:         new(cli.MockUi),
+		Command:    baseCommand(new(cli.MockUi)),
 	}
 
 	serfAddr := fmt.Sprintf("%s:%d", conf.BindAddr, conf.Ports.SerfWan)
@@ -268,6 +297,7 @@ func TestRetryJoinWanFail(t *testing.T) {
 		"-data-dir", tmpDir,
 		"-retry-join-wan", serfAddr,
 		"-retry-max-wan", "1",
+		"-retry-interval-wan", "10ms",
 	}
 
 	if code := cmd.Run(args); code == 0 {
@@ -305,59 +335,30 @@ func TestDiscoverEC2Hosts(t *testing.T) {
 	}
 }
 
-func TestSetupAgent_RPCUnixSocket_FileExists(t *testing.T) {
-	conf := nextConfig()
-	tmpDir, err := ioutil.TempDir("", "consul")
+func TestDiscoverGCEHosts(t *testing.T) {
+	if os.Getenv("GCE_PROJECT") == "" {
+		t.Skip("GCE_PROJECT not set, skipping")
+	}
+
+	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" && os.Getenv("GCE_CONFIG_CREDENTIALS") == "" {
+		t.Skip("GOOGLE_APPLICATION_CREDENTIALS or GCE_CONFIG_CREDENTIALS not set, skipping")
+	}
+
+	c := &Config{
+		RetryJoinGCE: RetryJoinGCE{
+			ProjectName:     os.Getenv("GCE_PROJECT"),
+			ZonePattern:     os.Getenv("GCE_ZONE"),
+			TagValue:        "consulrole-server",
+			CredentialsFile: os.Getenv("GCE_CONFIG_CREDENTIALS"),
+		},
+	}
+
+	servers, err := c.discoverGCEHosts(log.New(os.Stderr, "", log.LstdFlags))
 	if err != nil {
-		t.Fatalf("err: %s", err)
+		t.Fatal(err)
 	}
-	defer os.RemoveAll(tmpDir)
-
-	tmpFile, err := ioutil.TempFile("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	socketPath := tmpFile.Name()
-
-	conf.DataDir = tmpDir
-	conf.Server = true
-	conf.Bootstrap = true
-
-	// Set socket address to an existing file.
-	conf.Addresses.RPC = "unix://" + socketPath
-
-	// Custom mode for socket file
-	conf.UnixSockets.Perms = "0777"
-
-	shutdownCh := make(chan struct{})
-	defer close(shutdownCh)
-
-	cmd := &Command{
-		ShutdownCh: shutdownCh,
-		Ui:         new(cli.MockUi),
-	}
-
-	logWriter := logger.NewLogWriter(512)
-	logOutput := new(bytes.Buffer)
-
-	// Ensure the server is created
-	if err := cmd.setupAgent(conf, logOutput, logWriter); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	// Ensure the file was replaced by the socket
-	fi, err := os.Stat(socketPath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if fi.Mode()&os.ModeSocket == 0 {
-		t.Fatalf("expected socket to replace file")
-	}
-
-	// Ensure permissions were applied to the socket file
-	if fi.Mode().String() != "Srwxrwxrwx" {
-		t.Fatalf("bad permissions: %s", fi.Mode())
+	if len(servers) != 3 {
+		t.Fatalf("bad: %v", servers)
 	}
 }
 
@@ -373,7 +374,7 @@ func TestSetupScadaConn(t *testing.T) {
 
 	cmd := &Command{
 		ShutdownCh: make(chan struct{}),
-		Ui:         new(cli.MockUi),
+		Command:    baseCommand(new(cli.MockUi)),
 		agent:      agent,
 	}
 
@@ -381,7 +382,7 @@ func TestSetupScadaConn(t *testing.T) {
 	if err := cmd.setupScadaConn(conf1); err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	http1 := cmd.scadaHttp
+	http1 := cmd.scadaHTTP
 	provider1 := cmd.scadaProvider
 
 	// Performing setup again tears down original and replaces
@@ -392,8 +393,8 @@ func TestSetupScadaConn(t *testing.T) {
 	if err := cmd.setupScadaConn(conf2); err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	if cmd.scadaHttp == http1 || cmd.scadaProvider == provider1 {
-		t.Fatalf("should change: %#v %#v", cmd.scadaHttp, cmd.scadaProvider)
+	if cmd.scadaHTTP == http1 || cmd.scadaProvider == provider1 {
+		t.Fatalf("should change: %#v %#v", cmd.scadaHTTP, cmd.scadaProvider)
 	}
 
 	// Original provider and listener must be closed
@@ -430,8 +431,8 @@ func TestProtectDataDir(t *testing.T) {
 
 	ui := new(cli.MockUi)
 	cmd := &Command{
-		Ui:   ui,
-		args: []string{"-config-file=" + cfgFile.Name()},
+		Command: baseCommand(ui),
+		args:    []string{"-config-file=" + cfgFile.Name()},
 	}
 	if conf := cmd.readConfig(); conf != nil {
 		t.Fatalf("should fail")
@@ -456,8 +457,8 @@ func TestBadDataDirPermissions(t *testing.T) {
 
 	ui := new(cli.MockUi)
 	cmd := &Command{
-		Ui:   ui,
-		args: []string{"-data-dir=" + dataDir, "-server=true"},
+		Command: baseCommand(ui),
+		args:    []string{"-data-dir=" + dataDir, "-server=true"},
 	}
 	if conf := cmd.readConfig(); conf != nil {
 		t.Fatalf("Should fail with bad data directory permissions")

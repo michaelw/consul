@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/types"
 )
 
@@ -105,13 +106,79 @@ func TestStructs_ACL_IsSame(t *testing.T) {
 	check(func() { other.Rules = "" }, func() { other.Rules = "service \"\" { policy = \"read\" }" })
 }
 
+func TestStructs_RegisterRequest_ChangesNode(t *testing.T) {
+	req := &RegisterRequest{
+		ID:              types.NodeID("40e4a748-2192-161a-0510-9bf59fe950b5"),
+		Node:            "test",
+		Address:         "127.0.0.1",
+		Datacenter:      "dc1",
+		TaggedAddresses: make(map[string]string),
+		NodeMeta: map[string]string{
+			"role": "server",
+		},
+	}
+
+	node := &Node{
+		ID:              types.NodeID("40e4a748-2192-161a-0510-9bf59fe950b5"),
+		Node:            "test",
+		Address:         "127.0.0.1",
+		Datacenter:      "dc1",
+		TaggedAddresses: make(map[string]string),
+		Meta: map[string]string{
+			"role": "server",
+		},
+	}
+
+	check := func(twiddle, restore func()) {
+		if req.ChangesNode(node) {
+			t.Fatalf("should not change")
+		}
+
+		twiddle()
+		if !req.ChangesNode(node) {
+			t.Fatalf("should change")
+		}
+
+		req.SkipNodeUpdate = true
+		if req.ChangesNode(node) {
+			t.Fatalf("should skip")
+		}
+
+		req.SkipNodeUpdate = false
+		if !req.ChangesNode(node) {
+			t.Fatalf("should change")
+		}
+
+		restore()
+		if req.ChangesNode(node) {
+			t.Fatalf("should not change")
+		}
+	}
+
+	check(func() { req.ID = "nope" }, func() { req.ID = types.NodeID("40e4a748-2192-161a-0510-9bf59fe950b5") })
+	check(func() { req.Node = "nope" }, func() { req.Node = "test" })
+	check(func() { req.Address = "127.0.0.2" }, func() { req.Address = "127.0.0.1" })
+	check(func() { req.Datacenter = "dc2" }, func() { req.Datacenter = "dc1" })
+	check(func() { req.TaggedAddresses["wan"] = "nope" }, func() { delete(req.TaggedAddresses, "wan") })
+	check(func() { req.NodeMeta["invalid"] = "nope" }, func() { delete(req.NodeMeta, "invalid") })
+
+	if !req.ChangesNode(nil) {
+		t.Fatalf("should change")
+	}
+}
+
 // testServiceNode gives a fully filled out ServiceNode instance.
 func testServiceNode() *ServiceNode {
 	return &ServiceNode{
-		Node:    "node1",
-		Address: "127.0.0.1",
+		ID:         types.NodeID("40e4a748-2192-161a-0510-9bf59fe950b5"),
+		Node:       "node1",
+		Address:    "127.0.0.1",
+		Datacenter: "dc1",
 		TaggedAddresses: map[string]string{
 			"hello": "world",
+		},
+		NodeMeta: map[string]string{
+			"tag": "value",
 		},
 		ServiceID:                "service1",
 		ServiceName:              "dogs",
@@ -134,12 +201,19 @@ func TestStructs_ServiceNode_PartialClone(t *testing.T) {
 	// Make sure the parts that weren't supposed to be cloned didn't get
 	// copied over, then zero-value them out so we can do a DeepEqual() on
 	// the rest of the contents.
-	if clone.Address != "" || len(clone.TaggedAddresses) != 0 {
+	if clone.ID != "" ||
+		clone.Address != "" ||
+		clone.Datacenter != "" ||
+		len(clone.TaggedAddresses) != 0 ||
+		len(clone.NodeMeta) != 0 {
 		t.Fatalf("bad: %v", clone)
 	}
 
+	sn.ID = ""
 	sn.Address = ""
+	sn.Datacenter = ""
 	sn.TaggedAddresses = nil
+	sn.NodeMeta = nil
 	if !reflect.DeepEqual(sn, clone) {
 		t.Fatalf("bad: %v", clone)
 	}
@@ -157,8 +231,11 @@ func TestStructs_ServiceNode_Conversions(t *testing.T) {
 
 	// These two fields get lost in the conversion, so we have to zero-value
 	// them out before we do the compare.
+	sn.ID = ""
 	sn.Address = ""
+	sn.Datacenter = ""
 	sn.TaggedAddresses = nil
+	sn.NodeMeta = nil
 	if !reflect.DeepEqual(sn, sn2) {
 		t.Fatalf("bad: %v", sn2)
 	}
@@ -223,11 +300,12 @@ func TestStructs_HealthCheck_IsSame(t *testing.T) {
 		Node:        "node1",
 		CheckID:     "check1",
 		Name:        "thecheck",
-		Status:      HealthPassing,
+		Status:      api.HealthPassing,
 		Notes:       "it's all good",
 		Output:      "lgtm",
 		ServiceID:   "service1",
 		ServiceName: "theservice",
+		ServiceTags: []string{"foo"},
 	}
 	if !hc.IsSame(hc) {
 		t.Fatalf("should be equal to itself")
@@ -237,11 +315,12 @@ func TestStructs_HealthCheck_IsSame(t *testing.T) {
 		Node:        "node1",
 		CheckID:     "check1",
 		Name:        "thecheck",
-		Status:      HealthPassing,
+		Status:      api.HealthPassing,
 		Notes:       "it's all good",
 		Output:      "lgtm",
 		ServiceID:   "service1",
 		ServiceName: "theservice",
+		ServiceTags: []string{"foo"},
 		RaftIndex: RaftIndex{
 			CreateIndex: 1,
 			ModifyIndex: 2,
@@ -300,7 +379,7 @@ func TestStructs_HealthCheck_Clone(t *testing.T) {
 		Node:        "node1",
 		CheckID:     "check1",
 		Name:        "thecheck",
-		Status:      HealthPassing,
+		Status:      api.HealthPassing,
 		Notes:       "it's all good",
 		Output:      "lgtm",
 		ServiceID:   "service1",
@@ -359,7 +438,7 @@ func TestStructs_CheckServiceNodes_Filter(t *testing.T) {
 			},
 			Checks: HealthChecks{
 				&HealthCheck{
-					Status: HealthWarning,
+					Status: api.HealthWarning,
 				},
 			},
 		},
@@ -370,7 +449,7 @@ func TestStructs_CheckServiceNodes_Filter(t *testing.T) {
 			},
 			Checks: HealthChecks{
 				&HealthCheck{
-					Status: HealthPassing,
+					Status: api.HealthPassing,
 				},
 			},
 		},
@@ -381,7 +460,7 @@ func TestStructs_CheckServiceNodes_Filter(t *testing.T) {
 			},
 			Checks: HealthChecks{
 				&HealthCheck{
-					Status: HealthCritical,
+					Status: api.HealthCritical,
 				},
 			},
 		},
@@ -440,5 +519,68 @@ func TestStructs_DirEntry_Clone(t *testing.T) {
 	e.Value = []byte("a new value")
 	if reflect.DeepEqual(e, clone) {
 		t.Fatalf("clone wasn't independent of the original")
+	}
+}
+
+func TestStructs_ValidateMetadata(t *testing.T) {
+	// Load a valid set of key/value pairs
+	meta := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+	}
+	// Should succeed
+	if err := ValidateMetadata(meta); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Should get error
+	meta = map[string]string{
+		"": "value1",
+	}
+	if err := ValidateMetadata(meta); !strings.Contains(err.Error(), "Couldn't load metadata pair") {
+		t.Fatalf("should have failed")
+	}
+
+	// Should get error
+	meta = make(map[string]string)
+	for i := 0; i < metaMaxKeyPairs+1; i++ {
+		meta[string(i)] = "value"
+	}
+	if err := ValidateMetadata(meta); !strings.Contains(err.Error(), "cannot contain more than") {
+		t.Fatalf("should have failed")
+	}
+}
+
+func TestStructs_validateMetaPair(t *testing.T) {
+	longKey := strings.Repeat("a", metaKeyMaxLength+1)
+	longValue := strings.Repeat("b", metaValueMaxLength+1)
+	pairs := []struct {
+		Key   string
+		Value string
+		Error string
+	}{
+		// valid pair
+		{"key", "value", ""},
+		// invalid, blank key
+		{"", "value", "cannot be blank"},
+		// allowed special chars in key name
+		{"k_e-y", "value", ""},
+		// disallowed special chars in key name
+		{"(%key&)", "value", "invalid characters"},
+		// key too long
+		{longKey, "value", "Key is too long"},
+		// reserved prefix
+		{metaKeyReservedPrefix + "key", "value", "reserved for internal use"},
+		// value too long
+		{"key", longValue, "Value is too long"},
+	}
+
+	for _, pair := range pairs {
+		err := validateMetaPair(pair.Key, pair.Value)
+		if pair.Error == "" && err != nil {
+			t.Fatalf("should have succeeded: %v, %v", pair, err)
+		} else if pair.Error != "" && !strings.Contains(err.Error(), pair.Error) {
+			t.Fatalf("should have failed: %v, %v", pair, err)
+		}
 	}
 }

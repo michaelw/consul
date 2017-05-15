@@ -2,6 +2,7 @@ package consul
 
 import (
 	"strings"
+	"time"
 
 	"github.com/hashicorp/consul/consul/agent"
 	"github.com/hashicorp/raft"
@@ -15,6 +16,12 @@ const (
 
 	// userEventPrefix is pre-pended to a user event to distinguish it
 	userEventPrefix = "consul:event:"
+
+	// maxPeerRetries limits how many invalidate attempts are made
+	maxPeerRetries = 6
+
+	// peerRetryBase is a baseline retry time
+	peerRetryBase = 1 * time.Second
 )
 
 // userEventName computes the name of a user event
@@ -50,34 +57,11 @@ func (s *Server) lanEventHandler() {
 				s.localMemberEvent(e.(serf.MemberEvent))
 			case serf.EventUser:
 				s.localEvent(e.(serf.UserEvent))
-			case serf.EventMemberUpdate: // Ignore
+			case serf.EventMemberUpdate:
+				s.localMemberEvent(e.(serf.MemberEvent))
 			case serf.EventQuery: // Ignore
 			default:
 				s.logger.Printf("[WARN] consul: Unhandled LAN Serf Event: %#v", e)
-			}
-
-		case <-s.shutdownCh:
-			return
-		}
-	}
-}
-
-// wanEventHandler is used to handle events from the wan Serf cluster
-func (s *Server) wanEventHandler() {
-	for {
-		select {
-		case e := <-s.eventChWAN:
-			switch e.EventType() {
-			case serf.EventMemberJoin:
-				s.wanNodeJoin(e.(serf.MemberEvent))
-			case serf.EventMemberLeave, serf.EventMemberFailed:
-				s.wanNodeFailed(e.(serf.MemberEvent))
-			case serf.EventMemberUpdate: // Ignore
-			case serf.EventMemberReap: // Ignore
-			case serf.EventUser:
-			case serf.EventQuery: // Ignore
-			default:
-				s.logger.Printf("[WARN] consul: Unhandled WAN Serf Event: %#v", e)
 			}
 
 		case <-s.shutdownCh:
@@ -158,36 +142,9 @@ func (s *Server) lanNodeJoin(me serf.MemberEvent) {
 		if s.config.BootstrapExpect != 0 {
 			s.maybeBootstrap()
 		}
-	}
-}
 
-// wanNodeJoin is used to handle join events on the WAN pool.
-func (s *Server) wanNodeJoin(me serf.MemberEvent) {
-	for _, m := range me.Members {
-		ok, parts := agent.IsConsulServer(m)
-		if !ok {
-			s.logger.Printf("[WARN] consul: Non-server in WAN pool: %s", m.Name)
-			continue
-		}
-		s.logger.Printf("[INFO] consul: Adding WAN server %s", parts)
-
-		// Search for this node in our existing remotes.
-		found := false
-		s.remoteLock.Lock()
-		existing := s.remoteConsuls[parts.Datacenter]
-		for idx, e := range existing {
-			if e.Name == parts.Name {
-				existing[idx] = parts
-				found = true
-				break
-			}
-		}
-
-		// Add to the list if not known.
-		if !found {
-			s.remoteConsuls[parts.Datacenter] = append(existing, parts)
-		}
-		s.remoteLock.Unlock()
+		// Kick the join flooders.
+		s.FloodNotify()
 	}
 }
 
@@ -238,10 +195,18 @@ func (s *Server) maybeBootstrap() {
 	// Query each of the servers and make sure they report no Raft peers.
 	for _, server := range servers {
 		var peers []string
-		if err := s.connPool.RPC(s.config.Datacenter, server.Addr, server.Version,
-			"Status.Peers", &struct{}{}, &peers); err != nil {
-			s.logger.Printf("[ERR] consul: Failed to confirm peer status for %s: %v", server.Name, err)
-			return
+
+		// Retry with exponential backoff to get peer status from this server
+		for attempt := uint(0); attempt < maxPeerRetries; attempt++ {
+			if err := s.connPool.RPC(s.config.Datacenter, server.Addr, server.Version,
+				"Status.Peers", &struct{}{}, &peers); err != nil {
+				nextRetry := time.Duration((1 << attempt) * peerRetryBase)
+				s.logger.Printf("[ERR] consul: Failed to confirm peer status for %s: %v. Retrying in "+
+					"%v...", server.Name, err, nextRetry.String())
+				time.Sleep(nextRetry)
+			} else {
+				break
+			}
 		}
 
 		// Found a node with some Raft peers, stop bootstrap since there's
@@ -265,11 +230,22 @@ func (s *Server) maybeBootstrap() {
 	// Attempt a live bootstrap!
 	var configuration raft.Configuration
 	var addrs []string
+	minRaftVersion, err := ServerMinRaftProtocol(members)
+	if err != nil {
+		s.logger.Printf("[ERR] consul: Failed to read server raft versions: %v", err)
+	}
+
 	for _, server := range servers {
 		addr := server.Addr.String()
 		addrs = append(addrs, addr)
+		var id raft.ServerID
+		if minRaftVersion >= 3 {
+			id = raft.ServerID(server.ID)
+		} else {
+			id = raft.ServerID(addr)
+		}
 		peer := raft.Server{
-			ID:      raft.ServerID(addr),
+			ID:      id,
 			Address: raft.ServerAddress(addr),
 		}
 		configuration.Servers = append(configuration.Servers, peer)
@@ -298,37 +274,5 @@ func (s *Server) lanNodeFailed(me serf.MemberEvent) {
 		s.localLock.Lock()
 		delete(s.localConsuls, raft.ServerAddress(parts.Addr.String()))
 		s.localLock.Unlock()
-	}
-}
-
-// wanNodeFailed is used to handle fail events on the WAN pool.
-func (s *Server) wanNodeFailed(me serf.MemberEvent) {
-	for _, m := range me.Members {
-		ok, parts := agent.IsConsulServer(m)
-		if !ok {
-			continue
-		}
-		s.logger.Printf("[INFO] consul: Removing WAN server %s", parts)
-
-		// Remove the server if known
-		s.remoteLock.Lock()
-		existing := s.remoteConsuls[parts.Datacenter]
-		n := len(existing)
-		for i := 0; i < n; i++ {
-			if existing[i].Name == parts.Name {
-				existing[i], existing[n-1] = existing[n-1], nil
-				existing = existing[:n-1]
-				n--
-				break
-			}
-		}
-
-		// Trim the list if all known consuls are dead
-		if n == 0 {
-			delete(s.remoteConsuls, parts.Datacenter)
-		} else {
-			s.remoteConsuls[parts.Datacenter] = existing
-		}
-		s.remoteLock.Unlock()
 	}
 }

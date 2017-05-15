@@ -10,13 +10,19 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/consul/version"
+	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/raft"
 )
 
@@ -25,7 +31,6 @@ const (
 
 	portOffsetDNS = iota
 	portOffsetHTTP
-	portOffsetRPC
 	portOffsetSerfLan
 	portOffsetSerfWan
 	portOffsetServer
@@ -34,26 +39,36 @@ const (
 	numPortsPerIndex
 )
 
+func init() {
+	version.Version = "0.8.0"
+}
+
 var offset uint64 = basePortNumber
 
 func nextConfig() *Config {
 	idx := int(atomic.AddUint64(&offset, numPortsPerIndex))
 	conf := DefaultConfig()
 
-	conf.Version = "a.b"
+	nodeID, err := uuid.GenerateUUID()
+	if err != nil {
+		panic(err)
+	}
+
+	conf.Version = version.Version
 	conf.VersionPrerelease = "c.d"
 	conf.AdvertiseAddr = "127.0.0.1"
 	conf.Bootstrap = true
 	conf.Datacenter = "dc1"
 	conf.NodeName = fmt.Sprintf("Node %d", idx)
+	conf.NodeID = types.NodeID(nodeID)
 	conf.BindAddr = "127.0.0.1"
 	conf.Ports.DNS = basePortNumber + idx + portOffsetDNS
 	conf.Ports.HTTP = basePortNumber + idx + portOffsetHTTP
-	conf.Ports.RPC = basePortNumber + idx + portOffsetRPC
 	conf.Ports.SerfLan = basePortNumber + idx + portOffsetSerfLan
 	conf.Ports.SerfWan = basePortNumber + idx + portOffsetSerfWan
 	conf.Ports.Server = basePortNumber + idx + portOffsetServer
 	conf.Server = true
+	conf.ACLEnforceVersion8 = Bool(false)
 	conf.ACLDatacenter = "dc1"
 	conf.ACLMasterToken = "root"
 
@@ -74,19 +89,19 @@ func nextConfig() *Config {
 	cons.RaftConfig.HeartbeatTimeout = 40 * time.Millisecond
 	cons.RaftConfig.ElectionTimeout = 40 * time.Millisecond
 
-	cons.DisableCoordinates = false
 	cons.CoordinateUpdatePeriod = 100 * time.Millisecond
+	cons.ServerHealthInterval = 10 * time.Millisecond
 	return conf
 }
 
-func makeAgentLog(t *testing.T, conf *Config, l io.Writer) (string, *Agent) {
+func makeAgentLog(t *testing.T, conf *Config, l io.Writer, writer *logger.LogWriter) (string, *Agent) {
 	dir, err := ioutil.TempDir("", "agent")
 	if err != nil {
 		t.Fatalf(fmt.Sprintf("err: %v", err))
 	}
 
 	conf.DataDir = dir
-	agent, err := Create(conf, l)
+	agent, err := Create(conf, l, writer, nil)
 	if err != nil {
 		os.RemoveAll(dir)
 		t.Fatalf(fmt.Sprintf("err: %v", err))
@@ -112,7 +127,7 @@ func makeAgentKeyring(t *testing.T, conf *Config, key string) (string, *Agent) {
 		t.Fatalf("err: %s", err)
 	}
 
-	agent, err := Create(conf, nil)
+	agent, err := Create(conf, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -121,7 +136,7 @@ func makeAgentKeyring(t *testing.T, conf *Config, key string) (string, *Agent) {
 }
 
 func makeAgent(t *testing.T, conf *Config) (string, *Agent) {
-	return makeAgentLog(t, conf, nil)
+	return makeAgentLog(t, conf, nil, nil)
 }
 
 func externalIP() (string, error) {
@@ -181,12 +196,12 @@ func TestAgent_CheckSerfBindAddrsSettings(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer agent.Shutdown()
 
-	serfWanBind := agent.consulConfig().SerfWANConfig.MemberlistConfig.BindAddr
+	serfWanBind := consulConfig(agent).SerfWANConfig.MemberlistConfig.BindAddr
 	if serfWanBind != ip {
 		t.Fatalf("SerfWanBindAddr is should be a non-loopback IP not %s", serfWanBind)
 	}
 
-	serfLanBind := agent.consulConfig().SerfLANConfig.MemberlistConfig.BindAddr
+	serfLanBind := consulConfig(agent).SerfLANConfig.MemberlistConfig.BindAddr
 	if serfLanBind != ip {
 		t.Fatalf("SerfLanBindAddr is should be a non-loopback IP not %s", serfWanBind)
 	}
@@ -200,23 +215,23 @@ func TestAgent_CheckAdvertiseAddrsSettings(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer agent.Shutdown()
 
-	serfLanAddr := agent.consulConfig().SerfLANConfig.MemberlistConfig.AdvertiseAddr
+	serfLanAddr := consulConfig(agent).SerfLANConfig.MemberlistConfig.AdvertiseAddr
 	if serfLanAddr != "127.0.0.42" {
 		t.Fatalf("SerfLan is not properly set to '127.0.0.42': %s", serfLanAddr)
 	}
-	serfLanPort := agent.consulConfig().SerfLANConfig.MemberlistConfig.AdvertisePort
+	serfLanPort := consulConfig(agent).SerfLANConfig.MemberlistConfig.AdvertisePort
 	if serfLanPort != 1233 {
 		t.Fatalf("SerfLan is not properly set to '1233': %d", serfLanPort)
 	}
-	serfWanAddr := agent.consulConfig().SerfWANConfig.MemberlistConfig.AdvertiseAddr
+	serfWanAddr := consulConfig(agent).SerfWANConfig.MemberlistConfig.AdvertiseAddr
 	if serfWanAddr != "127.0.0.43" {
 		t.Fatalf("SerfWan is not properly set to '127.0.0.43': %s", serfWanAddr)
 	}
-	serfWanPort := agent.consulConfig().SerfWANConfig.MemberlistConfig.AdvertisePort
+	serfWanPort := consulConfig(agent).SerfWANConfig.MemberlistConfig.AdvertisePort
 	if serfWanPort != 1234 {
 		t.Fatalf("SerfWan is not properly set to '1234': %d", serfWanPort)
 	}
-	rpc := agent.consulConfig().RPCAdvertise
+	rpc := consulConfig(agent).RPCAdvertise
 	if rpc != c.AdvertiseAddrs.RPC {
 		t.Fatalf("RPC is not properly set to %v: %s", c.AdvertiseAddrs.RPC, rpc)
 	}
@@ -239,7 +254,7 @@ func TestAgent_CheckPerformanceSettings(t *testing.T) {
 		defer agent.Shutdown()
 
 		raftMult := time.Duration(consul.DefaultRaftMultiplier)
-		r := agent.consulConfig().RaftConfig
+		r := consulConfig(agent).RaftConfig
 		def := raft.DefaultConfig()
 		if r.HeartbeatTimeout != raftMult*def.HeartbeatTimeout ||
 			r.ElectionTimeout != raftMult*def.ElectionTimeout ||
@@ -257,7 +272,7 @@ func TestAgent_CheckPerformanceSettings(t *testing.T) {
 		defer agent.Shutdown()
 
 		const raftMult time.Duration = 99
-		r := agent.consulConfig().RaftConfig
+		r := consulConfig(agent).RaftConfig
 		def := raft.DefaultConfig()
 		if r.HeartbeatTimeout != raftMult*def.HeartbeatTimeout ||
 			r.ElectionTimeout != raftMult*def.ElectionTimeout ||
@@ -274,12 +289,12 @@ func TestAgent_ReconnectConfigSettings(t *testing.T) {
 		defer os.RemoveAll(dir)
 		defer agent.Shutdown()
 
-		lan := agent.consulConfig().SerfLANConfig.ReconnectTimeout
+		lan := consulConfig(agent).SerfLANConfig.ReconnectTimeout
 		if lan != 3*24*time.Hour {
 			t.Fatalf("bad: %s", lan.String())
 		}
 
-		wan := agent.consulConfig().SerfWANConfig.ReconnectTimeout
+		wan := consulConfig(agent).SerfWANConfig.ReconnectTimeout
 		if wan != 3*24*time.Hour {
 			t.Fatalf("bad: %s", wan.String())
 		}
@@ -293,16 +308,118 @@ func TestAgent_ReconnectConfigSettings(t *testing.T) {
 		defer os.RemoveAll(dir)
 		defer agent.Shutdown()
 
-		lan := agent.consulConfig().SerfLANConfig.ReconnectTimeout
+		lan := consulConfig(agent).SerfLANConfig.ReconnectTimeout
 		if lan != 24*time.Hour {
 			t.Fatalf("bad: %s", lan.String())
 		}
 
-		wan := agent.consulConfig().SerfWANConfig.ReconnectTimeout
+		wan := consulConfig(agent).SerfWANConfig.ReconnectTimeout
 		if wan != 36*time.Hour {
 			t.Fatalf("bad: %s", wan.String())
 		}
 	}()
+}
+
+func TestAgent_setupNodeID(t *testing.T) {
+	c := nextConfig()
+	c.NodeID = ""
+	dir, agent := makeAgent(t, c)
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// The auto-assigned ID should be valid.
+	id := consulConfig(agent).NodeID
+	if _, err := uuid.ParseUUID(string(id)); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Running again should get the same ID (persisted in the file).
+	c.NodeID = ""
+	if err := agent.setupNodeID(c); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if newID := consulConfig(agent).NodeID; id != newID {
+		t.Fatalf("bad: %q vs %q", id, newID)
+	}
+
+	// Set an invalid ID via config.
+	c.NodeID = types.NodeID("nope")
+	err := agent.setupNodeID(c)
+	if err == nil || !strings.Contains(err.Error(), "uuid string is wrong length") {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Set a valid ID via config.
+	newID, err := uuid.GenerateUUID()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	c.NodeID = types.NodeID(strings.ToUpper(newID))
+	if err := agent.setupNodeID(c); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if id := consulConfig(agent).NodeID; string(id) != newID {
+		t.Fatalf("bad: %q vs. %q", id, newID)
+	}
+
+	// Set an invalid ID via the file.
+	fileID := filepath.Join(c.DataDir, "node-id")
+	if err := ioutil.WriteFile(fileID, []byte("adf4238a!882b!9ddc!4a9d!5b6758e4159e"), 0600); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	c.NodeID = ""
+	err = agent.setupNodeID(c)
+	if err == nil || !strings.Contains(err.Error(), "uuid is improperly formatted") {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Set a valid ID via the file.
+	if err := ioutil.WriteFile(fileID, []byte("ADF4238a-882b-9ddc-4a9d-5b6758e4159e"), 0600); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	c.NodeID = ""
+	if err := agent.setupNodeID(c); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if id := consulConfig(agent).NodeID; string(id) != "adf4238a-882b-9ddc-4a9d-5b6758e4159e" {
+		t.Fatalf("bad: %q vs. %q", id, newID)
+	}
+}
+
+func TestAgent_makeNodeID(t *testing.T) {
+	c := nextConfig()
+	c.NodeID = ""
+	dir, agent := makeAgent(t, c)
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// We should get a valid host-based ID initially.
+	id, err := agent.makeNodeID()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if _, err := uuid.ParseUUID(string(id)); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Calling again should yield the same ID since it's host-based.
+	another, err := agent.makeNodeID()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if id != another {
+		t.Fatalf("bad: %s vs %s", id, another)
+	}
+
+	// Turn off host-based IDs and try again. We should get a random ID.
+	agent.config.DisableHostNodeID = true
+	another, err = agent.makeNodeID()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if id == another {
+		t.Fatalf("bad: %s vs %s", id, another)
+	}
 }
 
 func TestAgent_AddService(t *testing.T) {
@@ -511,7 +628,7 @@ func TestAgent_AddCheck(t *testing.T) {
 		Node:    "foo",
 		CheckID: "mem",
 		Name:    "memory util",
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	chk := &CheckType{
 		Script:   "exit 0",
@@ -529,7 +646,7 @@ func TestAgent_AddCheck(t *testing.T) {
 	}
 
 	// Ensure our check is in the right state
-	if sChk.Status != structs.HealthCritical {
+	if sChk.Status != api.HealthCritical {
 		t.Fatalf("check not critical")
 	}
 
@@ -548,7 +665,7 @@ func TestAgent_AddCheck_StartPassing(t *testing.T) {
 		Node:    "foo",
 		CheckID: "mem",
 		Name:    "memory util",
-		Status:  structs.HealthPassing,
+		Status:  api.HealthPassing,
 	}
 	chk := &CheckType{
 		Script:   "exit 0",
@@ -566,7 +683,7 @@ func TestAgent_AddCheck_StartPassing(t *testing.T) {
 	}
 
 	// Ensure our check is in the right state
-	if sChk.Status != structs.HealthPassing {
+	if sChk.Status != api.HealthPassing {
 		t.Fatalf("check not passing")
 	}
 
@@ -585,7 +702,7 @@ func TestAgent_AddCheck_MinInterval(t *testing.T) {
 		Node:    "foo",
 		CheckID: "mem",
 		Name:    "memory util",
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	chk := &CheckType{
 		Script:   "exit 0",
@@ -640,7 +757,7 @@ func TestAgent_AddCheck_RestoreState(t *testing.T) {
 		CheckID: "baz",
 		TTL:     time.Minute,
 	}
-	err := agent.persistCheckState(ttl, structs.HealthPassing, "yup")
+	err := agent.persistCheckState(ttl, api.HealthPassing, "yup")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -665,7 +782,7 @@ func TestAgent_AddCheck_RestoreState(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing check")
 	}
-	if check.Status != structs.HealthPassing {
+	if check.Status != api.HealthPassing {
 		t.Fatalf("bad: %#v", check)
 	}
 	if check.Output != "yup" {
@@ -692,7 +809,7 @@ func TestAgent_RemoveCheck(t *testing.T) {
 		Node:    "foo",
 		CheckID: "mem",
 		Name:    "memory util",
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	chk := &CheckType{
 		Script:   "exit 0",
@@ -728,7 +845,7 @@ func TestAgent_updateTTLCheck(t *testing.T) {
 		Node:    "foo",
 		CheckID: "mem",
 		Name:    "memory util",
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	chk := &CheckType{
 		TTL: 15 * time.Second,
@@ -739,13 +856,13 @@ func TestAgent_updateTTLCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if err := agent.updateTTLCheck("mem", structs.HealthPassing, "foo"); err != nil {
+	if err := agent.updateTTLCheck("mem", api.HealthPassing, "foo"); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	// Ensure we have a check mapping.
 	status := agent.state.Checks()["mem"]
-	if status.Status != structs.HealthPassing {
+	if status.Status != api.HealthPassing {
 		t.Fatalf("bad: %v", status)
 	}
 	if status.Output != "foo" {
@@ -758,7 +875,7 @@ func TestAgent_ConsulService(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer agent.Shutdown()
 
-	testutil.WaitForLeader(t, agent.RPC, "dc1")
+	testrpc.WaitForLeader(t, agent.RPC, "dc1")
 
 	// Consul service is registered
 	services := agent.state.Services()
@@ -845,7 +962,7 @@ func TestAgent_PersistService(t *testing.T) {
 	agent.Shutdown()
 
 	// Should load it back during later start
-	agent2, err := Create(config, nil)
+	agent2, err := Create(config, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -979,7 +1096,7 @@ func TestAgent_PurgeServiceOnDuplicate(t *testing.T) {
 	}
 
 	config.Services = []*ServiceDefinition{svc2}
-	agent2, err := Create(config, nil)
+	agent2, err := Create(config, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1009,7 +1126,7 @@ func TestAgent_PersistCheck(t *testing.T) {
 		Node:    config.NodeName,
 		CheckID: "mem",
 		Name:    "memory check",
-		Status:  structs.HealthPassing,
+		Status:  api.HealthPassing,
 	}
 	chkType := &CheckType{
 		Script:   "/bin/true",
@@ -1072,7 +1189,7 @@ func TestAgent_PersistCheck(t *testing.T) {
 	agent.Shutdown()
 
 	// Should load it back during later start
-	agent2, err := Create(config, nil)
+	agent2, err := Create(config, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1082,7 +1199,7 @@ func TestAgent_PersistCheck(t *testing.T) {
 	if !ok {
 		t.Fatalf("bad: %#v", agent2.state.checks)
 	}
-	if result.Status != structs.HealthCritical {
+	if result.Status != api.HealthCritical {
 		t.Fatalf("bad: %#v", result)
 	}
 	if result.Name != "mem1" {
@@ -1108,7 +1225,7 @@ func TestAgent_PurgeCheck(t *testing.T) {
 		Node:    config.NodeName,
 		CheckID: "mem",
 		Name:    "memory check",
-		Status:  structs.HealthPassing,
+		Status:  api.HealthPassing,
 	}
 
 	file := filepath.Join(agent.config.DataDir, checksDir, checkIDHash(check.CheckID))
@@ -1144,7 +1261,7 @@ func TestAgent_PurgeCheckOnDuplicate(t *testing.T) {
 		Node:    config.NodeName,
 		CheckID: "mem",
 		Name:    "memory check",
-		Status:  structs.HealthPassing,
+		Status:  api.HealthPassing,
 	}
 
 	// First persist the check
@@ -1165,7 +1282,7 @@ func TestAgent_PurgeCheckOnDuplicate(t *testing.T) {
 	}
 
 	config.Checks = []*CheckDefinition{check2}
-	agent2, err := Create(config, nil)
+	agent2, err := Create(config, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1230,7 +1347,7 @@ func TestAgent_unloadChecks(t *testing.T) {
 		Node:        config.NodeName,
 		CheckID:     "service:redis",
 		Name:        "redischeck",
-		Status:      structs.HealthPassing,
+		Status:      api.HealthPassing,
 		ServiceID:   "redis",
 		ServiceName: "redis",
 	}
@@ -1238,7 +1355,7 @@ func TestAgent_unloadChecks(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 	found := false
-	for check, _ := range agent.state.Checks() {
+	for check := range agent.state.Checks() {
 		if check == check1.CheckID {
 			found = true
 			break
@@ -1254,7 +1371,7 @@ func TestAgent_unloadChecks(t *testing.T) {
 	}
 
 	// Make sure it was unloaded
-	for check, _ := range agent.state.Checks() {
+	for check := range agent.state.Checks() {
 		if check == check1.CheckID {
 			t.Fatalf("should have unloaded checks")
 		}
@@ -1300,7 +1417,7 @@ func TestAgent_unloadServices(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	found := false
-	for id, _ := range agent.state.Services() {
+	for id := range agent.state.Services() {
 		if id == svc.ID {
 			found = true
 			break
@@ -1317,7 +1434,7 @@ func TestAgent_unloadServices(t *testing.T) {
 
 	// Make sure it was unloaded and the consul service remains
 	found = false
-	for id, _ := range agent.state.Services() {
+	for id := range agent.state.Services() {
 		if id == svc.ID {
 			t.Fatalf("should have unloaded services")
 		}
@@ -1411,7 +1528,7 @@ func TestAgent_Service_Reap(t *testing.T) {
 	}
 	chkTypes := CheckTypes{
 		&CheckType{
-			Status: structs.HealthPassing,
+			Status: api.HealthPassing,
 			TTL:    10 * time.Millisecond,
 			DeregisterCriticalServiceAfter: 100 * time.Millisecond,
 		},
@@ -1440,7 +1557,7 @@ func TestAgent_Service_Reap(t *testing.T) {
 	}
 
 	// Pass the TTL.
-	if err := agent.updateTTLCheck("service:redis", structs.HealthPassing, "foo"); err != nil {
+	if err := agent.updateTTLCheck("service:redis", api.HealthPassing, "foo"); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if _, ok := agent.state.Services()["redis"]; !ok {
@@ -1485,7 +1602,7 @@ func TestAgent_Service_NoReap(t *testing.T) {
 	}
 	chkTypes := CheckTypes{
 		&CheckType{
-			Status: structs.HealthPassing,
+			Status: api.HealthPassing,
 			TTL:    10 * time.Millisecond,
 		},
 	}
@@ -1544,7 +1661,7 @@ func TestAgent_addCheck_restoresSnapshot(t *testing.T) {
 		Node:        config.NodeName,
 		CheckID:     "service:redis",
 		Name:        "redischeck",
-		Status:      structs.HealthPassing,
+		Status:      api.HealthPassing,
 		ServiceID:   "redis",
 		ServiceName: "redis",
 	}
@@ -1561,7 +1678,7 @@ func TestAgent_addCheck_restoresSnapshot(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing check")
 	}
-	if check.Status != structs.HealthPassing {
+	if check.Status != api.HealthPassing {
 		t.Fatalf("bad: %s", check.Status)
 	}
 }
@@ -1576,13 +1693,13 @@ func TestAgent_NodeMaintenanceMode(t *testing.T) {
 	agent.EnableNodeMaintenance("broken", "mytoken")
 
 	// Make sure the critical health check was added
-	check, ok := agent.state.Checks()[nodeMaintCheckID]
+	check, ok := agent.state.Checks()[structs.NodeMaint]
 	if !ok {
 		t.Fatalf("should have registered critical node check")
 	}
 
 	// Check that the token was used to register the check
-	if token := agent.state.CheckToken(nodeMaintCheckID); token != "mytoken" {
+	if token := agent.state.CheckToken(structs.NodeMaint); token != "mytoken" {
 		t.Fatalf("expected 'mytoken', got: '%s'", token)
 	}
 
@@ -1595,7 +1712,7 @@ func TestAgent_NodeMaintenanceMode(t *testing.T) {
 	agent.DisableNodeMaintenance()
 
 	// Ensure the check was deregistered
-	if _, ok := agent.state.Checks()[nodeMaintCheckID]; ok {
+	if _, ok := agent.state.Checks()[structs.NodeMaint]; ok {
 		t.Fatalf("should have deregistered critical node check")
 	}
 
@@ -1603,7 +1720,7 @@ func TestAgent_NodeMaintenanceMode(t *testing.T) {
 	agent.EnableNodeMaintenance("", "")
 
 	// Make sure the check was registered with the default note
-	check, ok = agent.state.Checks()[nodeMaintCheckID]
+	check, ok = agent.state.Checks()[structs.NodeMaint]
 	if !ok {
 		t.Fatalf("should have registered critical node check")
 	}
@@ -1634,7 +1751,7 @@ func TestAgent_checkStateSnapshot(t *testing.T) {
 		Node:        config.NodeName,
 		CheckID:     "service:redis",
 		Name:        "redischeck",
-		Status:      structs.HealthPassing,
+		Status:      api.HealthPassing,
 		ServiceID:   "redis",
 		ServiceName: "redis",
 	}
@@ -1665,7 +1782,7 @@ func TestAgent_checkStateSnapshot(t *testing.T) {
 	}
 
 	// Make sure state was restored
-	if out.Status != structs.HealthPassing {
+	if out.Status != api.HealthPassing {
 		t.Fatalf("should have restored check state")
 	}
 }
@@ -1681,7 +1798,7 @@ func TestAgent_loadChecks_checkFails(t *testing.T) {
 		Node:      config.NodeName,
 		CheckID:   "service:redis",
 		Name:      "redischeck",
-		Status:    structs.HealthPassing,
+		Status:    api.HealthPassing,
 		ServiceID: "nope",
 	}
 	if err := agent.persistCheck(check, nil); err != nil {
@@ -1719,7 +1836,7 @@ func TestAgent_persistCheckState(t *testing.T) {
 	}
 
 	// Persist some check state for the check
-	err := agent.persistCheckState(check, structs.HealthCritical, "nope")
+	err := agent.persistCheckState(check, api.HealthCritical, "nope")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1744,7 +1861,7 @@ func TestAgent_persistCheckState(t *testing.T) {
 	if p.Output != "nope" {
 		t.Fatalf("bad: %#v", p)
 	}
-	if p.Status != structs.HealthCritical {
+	if p.Status != api.HealthCritical {
 		t.Fatalf("bad: %#v", p)
 	}
 
@@ -1767,7 +1884,7 @@ func TestAgent_loadCheckState(t *testing.T) {
 	}
 
 	// Persist the check state
-	err := agent.persistCheckState(check, structs.HealthPassing, "yup")
+	err := agent.persistCheckState(check, api.HealthPassing, "yup")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1775,14 +1892,14 @@ func TestAgent_loadCheckState(t *testing.T) {
 	// Try to load the state
 	health := &structs.HealthCheck{
 		CheckID: "check1",
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	if err := agent.loadCheckState(health); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	// Should not have restored the status due to expiration
-	if health.Status != structs.HealthCritical {
+	if health.Status != api.HealthCritical {
 		t.Fatalf("bad: %#v", health)
 	}
 	if health.Output != "" {
@@ -1797,7 +1914,7 @@ func TestAgent_loadCheckState(t *testing.T) {
 
 	// Set a TTL which will not expire before we check it
 	check.TTL = time.Minute
-	err = agent.persistCheckState(check, structs.HealthPassing, "yup")
+	err = agent.persistCheckState(check, api.HealthPassing, "yup")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1808,7 +1925,7 @@ func TestAgent_loadCheckState(t *testing.T) {
 	}
 
 	// Should have restored
-	if health.Status != structs.HealthPassing {
+	if health.Status != api.HealthPassing {
 		t.Fatalf("bad: %#v", health)
 	}
 	if health.Output != "yup" {
@@ -1832,7 +1949,7 @@ func TestAgent_purgeCheckState(t *testing.T) {
 		CheckID: "check1",
 		TTL:     time.Minute,
 	}
-	err := agent.persistCheckState(check, structs.HealthPassing, "yup")
+	err := agent.persistCheckState(check, api.HealthPassing, "yup")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -1868,4 +1985,12 @@ func TestAgent_GetCoordinate(t *testing.T) {
 
 	check(true)
 	check(false)
+}
+
+func consulConfig(a *Agent) *consul.Config {
+	c, err := a.consulConfig()
+	if err != nil {
+		panic(err)
+	}
+	return c
 }

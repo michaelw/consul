@@ -4,11 +4,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 
+	"github.com/hashicorp/consul/consul/agent"
+	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/serf/serf"
 )
 
@@ -64,14 +64,6 @@ func init() {
 	privateBlocks[5] = block
 }
 
-// ensurePath is used to make sure a path exists
-func ensurePath(path string, dir bool) error {
-	if !dir {
-		path = filepath.Dir(path)
-	}
-	return os.MkdirAll(path, 0755)
-}
-
 // CanServersUnderstandProtocol checks to see if all the servers in the given
 // list understand the given protocol version. If there are no servers in the
 // list then this will return false.
@@ -99,6 +91,35 @@ func CanServersUnderstandProtocol(members []serf.Member, version uint8) (bool, e
 		}
 	}
 	return (numServers > 0) && (numWhoGrok == numServers), nil
+}
+
+// ServerMinRaftProtocol returns the lowest supported Raft protocol among alive servers
+func ServerMinRaftProtocol(members []serf.Member) (int, error) {
+	minVersion := -1
+	for _, m := range members {
+		if m.Tags["role"] != "consul" || m.Status != serf.StatusAlive {
+			continue
+		}
+
+		vsn, ok := m.Tags["raft_vsn"]
+		if !ok {
+			vsn = "1"
+		}
+		raftVsn, err := strconv.Atoi(vsn)
+		if err != nil {
+			return -1, err
+		}
+
+		if minVersion == -1 || raftVsn < minVersion {
+			minVersion = raftVsn
+		}
+	}
+
+	if minVersion == -1 {
+		return minVersion, fmt.Errorf("No servers found")
+	}
+
+	return minVersion, nil
 }
 
 // Returns if a member is a consul node. Returns a bool,
@@ -275,4 +296,18 @@ func runtimeStats() map[string]string {
 		"goroutines": strconv.FormatInt(int64(runtime.NumGoroutine()), 10),
 		"cpu_count":  strconv.FormatInt(int64(runtime.NumCPU()), 10),
 	}
+}
+
+// ServersMeetMinimumVersion returns whether the given alive servers are at least on the
+// given Consul version
+func ServersMeetMinimumVersion(members []serf.Member, minVersion *version.Version) bool {
+	for _, member := range members {
+		if valid, parts := agent.IsConsulServer(member); valid && parts.Status == serf.StatusAlive {
+			if parts.Build.LessThan(minVersion) {
+				return false
+			}
+		}
+	}
+
+	return true
 }

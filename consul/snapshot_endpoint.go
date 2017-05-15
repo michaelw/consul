@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"time"
 
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/snapshot"
@@ -29,11 +30,18 @@ func (s *Server) dispatchSnapshotRequest(args *structs.SnapshotRequest, in io.Re
 
 	// Perform DC forwarding.
 	if dc := args.Datacenter; dc != s.config.Datacenter {
-		server, ok := s.getRemoteServer(dc)
+		manager, server, ok := s.router.FindRoute(dc)
 		if !ok {
 			return nil, structs.ErrNoDCPath
 		}
-		return SnapshotRPC(s.connPool, dc, server.Addr, args, in, reply)
+
+		snap, err := SnapshotRPC(s.connPool, dc, server.Addr, args, in, reply)
+		if err != nil {
+			manager.NotifyFailedServer(server)
+			return nil, err
+		}
+
+		return snap, nil
 	}
 
 	// Perform leader forwarding if required.
@@ -52,7 +60,7 @@ func (s *Server) dispatchSnapshotRequest(args *structs.SnapshotRequest, in io.Re
 	if acl, err := s.resolveToken(args.Token); err != nil {
 		return nil, err
 	} else if acl != nil && !acl.Snapshot() {
-		return nil, permissionDeniedErr
+		return nil, errPermissionDenied
 	}
 
 	// Dispatch the operation.
@@ -92,11 +100,38 @@ func (s *Server) dispatchSnapshotRequest(args *structs.SnapshotRequest, in io.Re
 		if err := barrier.Error(); err != nil {
 			return nil, err
 		}
-		if err := s.revokeLeadership(); err != nil {
-			return nil, err
+
+		// This'll be used for feedback from the leader loop.
+		errCh := make(chan error, 1)
+		timeoutCh := time.After(time.Minute)
+
+		select {
+		// Tell the leader loop to reassert leader actions since we just
+		// replaced the state store contents.
+		case s.reassertLeaderCh <- errCh:
+
+		// We might have lost leadership while waiting to kick the loop.
+		case <-timeoutCh:
+			return nil, fmt.Errorf("timed out waiting to re-run leader actions")
+
+		// Make sure we don't get stuck during shutdown
+		case <-s.shutdownCh:
 		}
-		if err := s.establishLeadership(); err != nil {
-			return nil, err
+
+		select {
+		// Wait for the leader loop to finish up.
+		case err := <-errCh:
+			if err != nil {
+				return nil, err
+			}
+
+		// We might have lost leadership while the loop was doing its
+		// thing.
+		case <-timeoutCh:
+			return nil, fmt.Errorf("timed out waiting for re-run of leader actions")
+
+		// Make sure we don't get stuck during shutdown
+		case <-s.shutdownCh:
 		}
 
 		// Give the caller back an empty reader since there's nothing to
@@ -155,7 +190,7 @@ RESPOND:
 func SnapshotRPC(pool *ConnPool, dc string, addr net.Addr,
 	args *structs.SnapshotRequest, in io.Reader, reply *structs.SnapshotResponse) (io.ReadCloser, error) {
 
-	conn, hc, err := pool.Dial(dc, addr)
+	conn, hc, err := pool.DialTimeout(dc, addr, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}

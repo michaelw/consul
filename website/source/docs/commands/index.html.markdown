@@ -35,7 +35,7 @@ Available commands are:
     join           Tell Consul agent to join cluster
     keygen         Generates a new encryption key
     keyring        Manages gossip layer encryption keys
-    kv             Interact with the key-value store
+    kv             Interact with the KV store
     leave          Gracefully leaves the Consul cluster and shuts down
     lock           Execute a command holding a lock
     maint          Controls node or service maintenance mode
@@ -58,10 +58,122 @@ Usage: consul join [options] address ...
   Tells a running Consul agent (with "consul agent") to join the cluster
   by specifying at least one existing member.
 
-Options:
+HTTP API Options
 
-  -rpc-addr=127.0.0.1:8400  Address to the RPC server of the agent you want to contact
-                            to send this command. If this isn't specified, the command checks the
-                            CONSUL_RPC_ADDR env variable.
-  -wan                      Joins a server to another server in the WAN pool
+  -http-addr=<address>
+     The `address` and port of the Consul HTTP agent. The value can be
+     an IP address or DNS address, but it must also include the port.
+     This can also be specified via the CONSUL_HTTP_ADDR environment
+     variable. The default value is http://127.0.0.1:8500. The scheme
+     can also be set to HTTPS by setting the environment variable
+     CONSUL_HTTP_SSL=true.
+
+  -token=<value>
+     ACL token to use in the request. This can also be specified via the
+     CONSUL_HTTP_TOKEN environment variable. If unspecified, the query
+     will default to the token of the Consul agent at the HTTP address.
+
+Command Options
+
+  -wan
+     Joins a server to another server in the WAN pool.
+```
+
+## Environment Variables
+
+In addition to CLI flags, Consul reads environment variables for behavior
+defaults. CLI flags always take precedence over environment variables, but it
+is often helpful to use environment variables to configure the Consul agent,
+particularly with configuration management and init systems.
+
+These environment variables and their purpose are described below:
+
+## `CONSUL_HTTP_ADDR`
+
+This is the HTTP API address to the *local* Consul agent
+(not the remote server) specified as a URI:
+
+```
+CONSUL_HTTP_ADDR=127.0.0.1:8500
+```
+
+or as a Unix socket path:
+
+```
+CONSUL_HTTP_ADDR=unix://var/run/consul_http.sock
+```
+
+### `CONSUL_HTTP_TOKEN`
+
+This is the API access token required when access control lists (ACLs)
+are enabled, for example:
+
+```
+CONSUL_HTTP_TOKEN=aba7cbe5-879b-999a-07cc-2efd9ac0ffe
+```
+
+### `CONSUL_HTTP_AUTH`
+
+This specifies HTTP Basic access credentials as a username:password pair:
+
+```
+CONSUL_HTTP_AUTH=operations:JPIMCmhDHzTukgO6
+```
+
+### `CONSUL_HTTP_SSL`
+
+This is a boolean value (default is false) that enables the HTTPS URI
+scheme and SSL connections to the HTTP API:
+
+```
+CONSUL_HTTP_SSL=true
+```
+
+### `CONSUL_HTTP_SSL_VERIFY`
+
+This is a boolean value (default true) to specify SSL certificate verification; setting this value to `false` is not recommended for production use. Example
+for development purposes:
+
+```
+CONSUL_HTTP_SSL_VERIFY=false
+```
+
+### `CONSUL_CACERT`
+
+Path to a CA file to use for TLS when communicating with Consul.
+
+```
+CONSUL_CACERT=ca.crt
+```
+
+### `CONSUL_CAPATH`
+
+Path to a directory of CA certificates to use for TLS when communicating with Consul.
+
+```
+CONSUL_CAPATH=ca_certs/
+```
+
+### `CONSUL_CLIENT_CERT`
+
+Path to a client cert file to use for TLS when `verify_incoming` is enabled.
+
+```
+CONSUL_CLIENT_CERT=client.crt
+```
+
+### `CONSUL_CLIENT_KEY`
+
+Path to a client key file to use for TLS when `verify_incoming` is enabled.
+
+```
+CONSUL_CLIENT_KEY=client.key
+```
+
+### `CONSUL_TLS_SERVER_NAME`
+
+The server name to use as the SNI host when connecting via TLS.
+
+```
+CONSUL_TLS_SERVER_NAME=consulserver.domain
 ```

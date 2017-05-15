@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,7 +20,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/go-cleanhttp"
 )
 
@@ -28,15 +30,35 @@ func makeHTTPServer(t *testing.T) (string, *HTTPServer) {
 }
 
 func makeHTTPServerWithConfig(t *testing.T, cb func(c *Config)) (string, *HTTPServer) {
+	return makeHTTPServerWithConfigLog(t, cb, nil, nil)
+}
+
+func makeHTTPServerWithACLs(t *testing.T) (string, *HTTPServer) {
+	dir, srv := makeHTTPServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = c.Datacenter
+		c.ACLDefaultPolicy = "deny"
+		c.ACLMasterToken = "root"
+		c.ACLAgentToken = "root"
+		c.ACLAgentMasterToken = "towel"
+		c.ACLEnforceVersion8 = Bool(true)
+	})
+
+	// Need a leader to look up ACLs, so wait here so we don't need to
+	// repeat this in each test.
+	testrpc.WaitForLeader(t, srv.agent.RPC, "dc1")
+	return dir, srv
+}
+
+func makeHTTPServerWithConfigLog(t *testing.T, cb func(c *Config), l io.Writer, logWriter *logger.LogWriter) (string, *HTTPServer) {
 	configTry := 0
 RECONF:
-	configTry += 1
+	configTry++
 	conf := nextConfig()
 	if cb != nil {
 		cb(conf)
 	}
 
-	dir, agent := makeAgent(t, conf)
+	dir, agent := makeAgentLog(t, conf, l, logWriter)
 	servers, err := NewHTTPServers(agent, conf, agent.logOutput)
 	if err != nil {
 		if configTry < 3 {
@@ -98,7 +120,7 @@ func TestHTTPServer_UnixSocket(t *testing.T) {
 	// Ensure we can get a response from the socket.
 	path, _ := unixSocketAddr(srv.agent.config.Addresses.HTTP)
 	trans := cleanhttp.DefaultTransport()
-	trans.Dial = func(_, _ string) (net.Conn, error) {
+	trans.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
 		return net.Dial("unix", path)
 	}
 	client := &http.Client{
@@ -663,23 +685,23 @@ func TestScadaHTTP(t *testing.T) {
 	defer list.Close()
 
 	// Create the SCADA HTTP server
-	scadaHttp := newScadaHttp(agent, list)
+	scadaHTTP := newScadaHTTP(agent, list)
 
 	// Returned server uses the listener and scada addr
-	if scadaHttp.listener != list {
-		t.Fatalf("bad listener: %#v", scadaHttp)
+	if scadaHTTP.listener != list {
+		t.Fatalf("bad listener: %#v", scadaHTTP)
 	}
-	if scadaHttp.addr != scadaHTTPAddr {
-		t.Fatalf("expected %v, got: %v", scadaHttp.addr, scadaHTTPAddr)
+	if scadaHTTP.addr != scadaHTTPAddr {
+		t.Fatalf("expected %v, got: %v", scadaHTTP.addr, scadaHTTPAddr)
 	}
 
 	// Check that debug endpoints were not enabled. This will cause
 	// the serve mux to panic if the routes are already handled.
 	mockFn := func(w http.ResponseWriter, r *http.Request) {}
-	scadaHttp.mux.HandleFunc("/debug/pprof/", mockFn)
-	scadaHttp.mux.HandleFunc("/debug/pprof/cmdline", mockFn)
-	scadaHttp.mux.HandleFunc("/debug/pprof/profile", mockFn)
-	scadaHttp.mux.HandleFunc("/debug/pprof/symbol", mockFn)
+	scadaHTTP.mux.HandleFunc("/debug/pprof/", mockFn)
+	scadaHTTP.mux.HandleFunc("/debug/pprof/cmdline", mockFn)
+	scadaHTTP.mux.HandleFunc("/debug/pprof/profile", mockFn)
+	scadaHTTP.mux.HandleFunc("/debug/pprof/symbol", mockFn)
 }
 
 func TestEnableWebUI(t *testing.T) {
@@ -698,7 +720,7 @@ func TestEnableWebUI(t *testing.T) {
 			t.Fatalf("should handle ui")
 		}
 	}, func(c *Config) {
-		c.EnableUi = true
+		c.EnableUI = true
 	})
 }
 
@@ -741,6 +763,6 @@ func httpTestWithConfig(t *testing.T, f func(srv *HTTPServer), cb func(c *Config
 	defer os.RemoveAll(dir)
 	defer srv.Shutdown()
 	defer srv.agent.Shutdown()
-	testutil.WaitForLeader(t, srv.agent.RPC, "dc1")
+	testrpc.WaitForLeader(t, srv.agent.RPC, "dc1")
 	f(srv)
 }

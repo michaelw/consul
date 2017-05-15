@@ -2,12 +2,13 @@ package consul
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/serf/coordinate"
 )
 
@@ -119,6 +120,17 @@ func (c *Coordinate) Update(args *structs.CoordinateUpdateRequest, reply *struct
 		return fmt.Errorf("rejected bad coordinate: %v", args.Coord)
 	}
 
+	// Fetch the ACL token, if any, and enforce the node policy if enabled.
+	acl, err := c.srv.resolveToken(args.Token)
+	if err != nil {
+		return err
+	}
+	if acl != nil && c.srv.config.ACLEnforceVersion8 {
+		if !acl.NodeWrite(args.Node) {
+			return errPermissionDenied
+		}
+	}
+
 	// Add the coordinate to the map of pending updates.
 	c.updatesLock.Lock()
 	c.updates[args.Node] = args.Coord
@@ -130,17 +142,10 @@ func (c *Coordinate) Update(args *structs.CoordinateUpdateRequest, reply *struct
 // and the raw coordinates of those nodes (if no coordinates are available for
 // any of the nodes, the node list may be empty).
 func (c *Coordinate) ListDatacenters(args *struct{}, reply *[]structs.DatacenterMap) error {
-	c.srv.remoteLock.RLock()
-	defer c.srv.remoteLock.RUnlock()
-
-	// Build up a map of all the DCs, sort it first since getDatacenterMaps
-	// will preserve the order of this list in the output.
-	dcs := make([]string, 0, len(c.srv.remoteConsuls))
-	for dc := range c.srv.remoteConsuls {
-		dcs = append(dcs, dc)
+	maps, err := c.srv.router.GetDatacenterMaps()
+	if err != nil {
+		return err
 	}
-	sort.Strings(dcs)
-	maps := c.srv.getDatacenterMaps(dcs)
 
 	// Strip the datacenter suffixes from all the node names.
 	for i := range maps {
@@ -162,17 +167,18 @@ func (c *Coordinate) ListNodes(args *structs.DCSpecificRequest, reply *structs.I
 		return err
 	}
 
-	state := c.srv.fsm.State()
-	return c.srv.blockingRPC(&args.QueryOptions,
+	return c.srv.blockingQuery(&args.QueryOptions,
 		&reply.QueryMeta,
-		state.GetQueryWatch("Coordinates"),
-		func() error {
-			index, coords, err := state.Coordinates()
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, coords, err := state.Coordinates(ws)
 			if err != nil {
 				return err
 			}
 
 			reply.Index, reply.Coordinates = index, coords
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
 			return nil
 		})
 }

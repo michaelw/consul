@@ -42,7 +42,12 @@ which limits how stale results are allowed to be.
 Starting from Consul 0.7, [`allow_stale`](/docs/agent/options.html#allow_stale)
 is enabled by default, using a [`max_stale`](/docs/agent/options.html#max_stale)
 value that defaults to 5 seconds, meaning that we will use data from
-any Consul server that is within 5 seconds of the leader.
+any Consul server that is within 5 seconds of the leader. In Consul 0.7.1, the
+default for `max_stale` was been increased from 5 seconds to a near-indefinite
+threshold (10 years) to allow DNS queries to continue to be served in the event
+of a long outage with no leader. A new telemetry counter has also been added at
+`consul.dns.stale_queries` to track when agents serve DNS queries that are stale
+by more than 5 seconds.
 
 ## Negative Response Caching
 
@@ -95,7 +100,7 @@ This sets all lookups to "web.service.consul" to use a 30 second TTL
 while lookups to "db.service.consul" or "api.service.consul" will use the
 5 second TTL from the wildcard.
 
-[Prepared Queries](/docs/agent/http/query.html) provide an additional
+[Prepared Queries](/api/query.html) provide an additional
 level of control over TTL. They allow for the TTL to be defined along with
 the query, and they can be changed on the fly by updating the query definition.
 If a TTL is not configured for a prepared query, then it will fall back to the

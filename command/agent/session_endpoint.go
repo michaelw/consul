@@ -46,12 +46,13 @@ func (s *HTTPServer) SessionCreate(resp http.ResponseWriter, req *http.Request) 
 		},
 	}
 	s.parseDC(req, &args.Datacenter)
+	s.parseToken(req, &args.Token)
 
 	// Handle optional request body
 	if req.ContentLength > 0 {
 		if err := decodeBody(req, &args.Session, FixupLockDelay); err != nil {
 			resp.WriteHeader(400)
-			resp.Write([]byte(fmt.Sprintf("Request decode failed: %v", err)))
+			fmt.Fprintf(resp, "Request decode failed: %v", err)
 			return nil, nil
 		}
 	}
@@ -74,7 +75,7 @@ func FixupLockDelay(raw interface{}) error {
 		return nil
 	}
 	var key string
-	for k, _ := range rawMap {
+	for k := range rawMap {
 		if strings.ToLower(k) == "lockdelay" {
 			key = k
 			break
@@ -117,12 +118,13 @@ func (s *HTTPServer) SessionDestroy(resp http.ResponseWriter, req *http.Request)
 		Op: structs.SessionDestroy,
 	}
 	s.parseDC(req, &args.Datacenter)
+	s.parseToken(req, &args.Token)
 
 	// Pull out the session id
 	args.Session.ID = strings.TrimPrefix(req.URL.Path, "/v1/session/destroy/")
 	if args.Session.ID == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing session"))
+		fmt.Fprint(resp, "Missing session")
 		return nil, nil
 	}
 
@@ -150,7 +152,7 @@ func (s *HTTPServer) SessionRenew(resp http.ResponseWriter, req *http.Request) (
 	args.Session = strings.TrimPrefix(req.URL.Path, "/v1/session/renew/")
 	if args.Session == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing session"))
+		fmt.Fprint(resp, "Missing session")
 		return nil, nil
 	}
 
@@ -159,7 +161,7 @@ func (s *HTTPServer) SessionRenew(resp http.ResponseWriter, req *http.Request) (
 		return nil, err
 	} else if out.Sessions == nil {
 		resp.WriteHeader(404)
-		resp.Write([]byte(fmt.Sprintf("Session id '%s' not found", args.Session)))
+		fmt.Fprintf(resp, "Session id '%s' not found", args.Session)
 		return nil, nil
 	}
 
@@ -177,7 +179,7 @@ func (s *HTTPServer) SessionGet(resp http.ResponseWriter, req *http.Request) (in
 	args.Session = strings.TrimPrefix(req.URL.Path, "/v1/session/info/")
 	if args.Session == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing session"))
+		fmt.Fprint(resp, "Missing session")
 		return nil, nil
 	}
 
@@ -225,7 +227,7 @@ func (s *HTTPServer) SessionsForNode(resp http.ResponseWriter, req *http.Request
 	args.Node = strings.TrimPrefix(req.URL.Path, "/v1/session/node/")
 	if args.Node == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing node name"))
+		fmt.Fprint(resp, "Missing node name")
 		return nil, nil
 	}
 

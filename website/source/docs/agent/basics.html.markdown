@@ -32,14 +32,12 @@ When running [`consul agent`](/docs/commands/agent.html), you should see output 
 ```text
 $ consul agent -data-dir=/tmp/consul
 ==> Starting Consul agent...
-==> Starting Consul agent RPC...
 ==> Consul agent running!
        Node name: 'Armons-MacBook-Air'
       Datacenter: 'dc1'
           Server: false (bootstrap: false)
-     Client Addr: 127.0.0.1 (HTTP: 8500, DNS: 8600, RPC: 8400)
+     Client Addr: 127.0.0.1 (HTTP: 8500, DNS: 8600)
     Cluster Addr: 192.168.1.43 (LAN: 8301, WAN: 8302)
-           Atlas: (Infrastructure: 'hashicorp/test' Join: true)
 
 ==> Log data will now stream in as it occurs:
 
@@ -66,23 +64,15 @@ There are several important messages that [`consul agent`](/docs/commands/agent.
   cannot be in bootstrap mode as that would put the cluster in an inconsistent state.
 
 * **Client Addr**: This is the address used for client interfaces to the agent.
-  This includes the ports for the HTTP, DNS, and RPC interfaces. The RPC
-  address is used by other `consul` commands (such as
-  [`consul members`](/docs/commands/members.html), [`consul join`](/docs/commands/join.html),
-  etc) which query and control a running agent. By default, this binds only to localhost. If you
-  change this address or port, you'll have to specify a `-rpc-addr` whenever you run
-  commands such as [`consul members`](/docs/commands/members.html) to indicate how to
-  reach the agent. Other applications can also use the RPC address and port
-  [to control Consul](/docs/agent/rpc.html).
+  This includes the ports for the HTTP and DNS interfaces. By default, this binds only
+  to localhost. If you change this address or port, you'll have to specify a `-http-addr`
+  whenever you run commands such as [`consul members`](/docs/commands/members.html) to
+  indicate how to reach the agent. Other applications can also use the HTTP address and port
+  [to control Consul](/api/index.html).
 
 * **Cluster Addr**: This is the address and set of ports used for communication between
   Consul agents in a cluster. Not all Consul agents in a cluster have to
   use the same port, but this address **MUST** be reachable by all other nodes.
-
-* **Atlas**: This shows the [Atlas infrastructure](https://atlas.hashicorp.com)
-  with which the node is registered. It also indicates if auto-join is enabled.
-  The Atlas infrastructure is set using [`-atlas`](/docs/agent/options.html#_atlas)
-  and auto-join is enabled by setting [`-atlas-join`](/docs/agent/options.html#_atlas_join).
 
 ## Stopping an Agent
 
@@ -124,11 +114,8 @@ In the case of a network failure, some nodes may be unreachable by other nodes.
 In this case, unreachable nodes are marked as _failed_. It is impossible to distinguish
 between a network failure and an agent crash, so both cases are handled the same.
 Once a node is marked as failed, this information is updated in the service catalog.
-Note: there is some nuance here since this update is only possible if the servers can
-still [form a quorum](/docs/internals/consensus.html). Once the network recovers
-or a crashed agent restarts the cluster will repair itself and unmark
-a node as failed. The health check in the catalog will also be updated to reflect
-this.
+
+-> **Note:** There is some nuance here since this update is only possible if the servers can still [form a quorum](/docs/internals/consensus.html). Once the network recovers or a crashed agent restarts the cluster will repair itself and unmark a node as failed. The health check in the catalog will also be updated to reflect this.
 
 When a node _leaves_, it specifies its intent to do so, and the cluster
 marks that node as having _left_. Unlike the _failed_ case, all of the
@@ -139,5 +126,5 @@ To prevent an accumulation of dead nodes (nodes in either _failed_ or _left_
 states), Consul will automatically remove dead nodes out of the catalog. This
 process is called _reaping_. This is currently done on a configurable
 interval of 72 hours (changing the reap interval is *not* recommended due to
-its consequences during outage situations).  Reaping is similar to leaving,
+its consequences during outage situations). Reaping is similar to leaving,
 causing all associated services to be deregistered.

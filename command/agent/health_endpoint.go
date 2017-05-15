@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul/structs"
 )
 
@@ -11,6 +13,7 @@ func (s *HTTPServer) HealthChecksInState(resp http.ResponseWriter, req *http.Req
 	// Set default DC
 	args := structs.ChecksInStateRequest{}
 	s.parseSource(req, &args.Source)
+	args.NodeMetaFilters = s.parseMetaFilter(req)
 	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
 		return nil, nil
 	}
@@ -19,7 +22,7 @@ func (s *HTTPServer) HealthChecksInState(resp http.ResponseWriter, req *http.Req
 	args.State = strings.TrimPrefix(req.URL.Path, "/v1/health/state/")
 	if args.State == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing check state"))
+		fmt.Fprint(resp, "Missing check state")
 		return nil, nil
 	}
 
@@ -33,6 +36,11 @@ func (s *HTTPServer) HealthChecksInState(resp http.ResponseWriter, req *http.Req
 	// Use empty list instead of nil
 	if out.HealthChecks == nil {
 		out.HealthChecks = make(structs.HealthChecks, 0)
+	}
+	for _, c := range out.HealthChecks {
+		if c.ServiceTags == nil {
+			c.ServiceTags = make([]string, 0)
+		}
 	}
 	return out.HealthChecks, nil
 }
@@ -48,7 +56,7 @@ func (s *HTTPServer) HealthNodeChecks(resp http.ResponseWriter, req *http.Reques
 	args.Node = strings.TrimPrefix(req.URL.Path, "/v1/health/node/")
 	if args.Node == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing node name"))
+		fmt.Fprint(resp, "Missing node name")
 		return nil, nil
 	}
 
@@ -63,6 +71,11 @@ func (s *HTTPServer) HealthNodeChecks(resp http.ResponseWriter, req *http.Reques
 	if out.HealthChecks == nil {
 		out.HealthChecks = make(structs.HealthChecks, 0)
 	}
+	for _, c := range out.HealthChecks {
+		if c.ServiceTags == nil {
+			c.ServiceTags = make([]string, 0)
+		}
+	}
 	return out.HealthChecks, nil
 }
 
@@ -70,6 +83,7 @@ func (s *HTTPServer) HealthServiceChecks(resp http.ResponseWriter, req *http.Req
 	// Set default DC
 	args := structs.ServiceSpecificRequest{}
 	s.parseSource(req, &args.Source)
+	args.NodeMetaFilters = s.parseMetaFilter(req)
 	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
 		return nil, nil
 	}
@@ -78,7 +92,7 @@ func (s *HTTPServer) HealthServiceChecks(resp http.ResponseWriter, req *http.Req
 	args.ServiceName = strings.TrimPrefix(req.URL.Path, "/v1/health/checks/")
 	if args.ServiceName == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing service name"))
+		fmt.Fprint(resp, "Missing service name")
 		return nil, nil
 	}
 
@@ -93,6 +107,11 @@ func (s *HTTPServer) HealthServiceChecks(resp http.ResponseWriter, req *http.Req
 	if out.HealthChecks == nil {
 		out.HealthChecks = make(structs.HealthChecks, 0)
 	}
+	for _, c := range out.HealthChecks {
+		if c.ServiceTags == nil {
+			c.ServiceTags = make([]string, 0)
+		}
+	}
 	return out.HealthChecks, nil
 }
 
@@ -100,6 +119,7 @@ func (s *HTTPServer) HealthServiceNodes(resp http.ResponseWriter, req *http.Requ
 	// Set default DC
 	args := structs.ServiceSpecificRequest{}
 	s.parseSource(req, &args.Source)
+	args.NodeMetaFilters = s.parseMetaFilter(req)
 	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
 		return nil, nil
 	}
@@ -115,7 +135,7 @@ func (s *HTTPServer) HealthServiceNodes(resp http.ResponseWriter, req *http.Requ
 	args.ServiceName = strings.TrimPrefix(req.URL.Path, "/v1/health/service/")
 	if args.ServiceName == "" {
 		resp.WriteHeader(400)
-		resp.Write([]byte("Missing service name"))
+		fmt.Fprint(resp, "Missing service name")
 		return nil, nil
 	}
 
@@ -127,7 +147,7 @@ func (s *HTTPServer) HealthServiceNodes(resp http.ResponseWriter, req *http.Requ
 	}
 
 	// Filter to only passing if specified
-	if _, ok := params[structs.HealthPassing]; ok {
+	if _, ok := params[api.HealthPassing]; ok {
 		out.Nodes = filterNonPassing(out.Nodes)
 	}
 
@@ -135,18 +155,25 @@ func (s *HTTPServer) HealthServiceNodes(resp http.ResponseWriter, req *http.Requ
 	translateAddresses(s.agent.config, args.Datacenter, out.Nodes)
 
 	// Use empty list instead of nil
-	for i, _ := range out.Nodes {
+	if out.Nodes == nil {
+		out.Nodes = make(structs.CheckServiceNodes, 0)
+	}
+	for i := range out.Nodes {
 		// TODO (slackpad) It's lame that this isn't a slice of pointers
 		// but it's not a well-scoped change to fix this. We should
 		// change this at the next opportunity.
 		if out.Nodes[i].Checks == nil {
 			out.Nodes[i].Checks = make(structs.HealthChecks, 0)
 		}
+		for _, c := range out.Nodes[i].Checks {
+			if c.ServiceTags == nil {
+				c.ServiceTags = make([]string, 0)
+			}
+		}
+		if out.Nodes[i].Service != nil && out.Nodes[i].Service.Tags == nil {
+			out.Nodes[i].Service.Tags = make([]string, 0)
+		}
 	}
-	if out.Nodes == nil {
-		out.Nodes = make(structs.CheckServiceNodes, 0)
-	}
-
 	return out.Nodes, nil
 }
 
@@ -157,7 +184,7 @@ OUTER:
 	for i := 0; i < n; i++ {
 		node := nodes[i]
 		for _, check := range node.Checks {
-			if check.Status != structs.HealthPassing {
+			if check.Status != api.HealthPassing {
 				nodes[i], nodes[n-1] = nodes[n-1], structs.CheckServiceNode{}
 				n--
 				i--

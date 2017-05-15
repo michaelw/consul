@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/testutil/retry"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
 	"github.com/hashicorp/serf/coordinate"
 )
@@ -25,13 +27,14 @@ func TestPreparedQuery_Apply(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
 	// Set up a bare bones query.
 	query := structs.PreparedQueryRequest{
 		Datacenter: "dc1",
 		Op:         structs.PreparedQueryCreate,
 		Query: &structs.PreparedQuery{
+			Name: "test",
 			Service: structs.ServiceQuery{
 				Service: "redis",
 			},
@@ -188,7 +191,7 @@ func TestPreparedQuery_Apply_ACLDeny(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
 	// Create an ACL with write permissions for redis queries.
 	var token string
@@ -474,14 +477,10 @@ func TestPreparedQuery_Apply_ForwardLeader(t *testing.T) {
 	defer codec2.Close()
 
 	// Try to join.
-	addr := fmt.Sprintf("127.0.0.1:%d",
-		s1.config.SerfLANConfig.MemberlistConfig.BindPort)
-	if _, err := s2.JoinLAN([]string{addr}); err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	joinLAN(t, s2, s1)
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
-	testutil.WaitForLeader(t, s2.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s2.RPC, "dc1")
 
 	// Use the follower as the client.
 	var codec rpc.ClientCodec
@@ -515,6 +514,7 @@ func TestPreparedQuery_Apply_ForwardLeader(t *testing.T) {
 		Datacenter: "dc1",
 		Op:         structs.PreparedQueryCreate,
 		Query: &structs.PreparedQuery{
+			Name: "test",
 			Service: structs.ServiceQuery{
 				Service: "redis",
 			},
@@ -531,53 +531,88 @@ func TestPreparedQuery_Apply_ForwardLeader(t *testing.T) {
 func TestPreparedQuery_parseQuery(t *testing.T) {
 	query := &structs.PreparedQuery{}
 
-	err := parseQuery(query)
+	err := parseQuery(query, true)
+	if err == nil || !strings.Contains(err.Error(), "Must be bound to a session") {
+		t.Fatalf("bad: %v", err)
+	}
+
+	query.Session = "adf4238a-882b-9ddc-4a9d-5b6758e4159e"
+	err = parseQuery(query, true)
 	if err == nil || !strings.Contains(err.Error(), "Must provide a Service") {
 		t.Fatalf("bad: %v", err)
 	}
 
-	query.Service.Service = "foo"
-	if err := parseQuery(query); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	query.Token = redactedToken
-	err = parseQuery(query)
-	if err == nil || !strings.Contains(err.Error(), "Bad Token") {
+	query.Session = ""
+	query.Template.Type = "some-kind-of-template"
+	err = parseQuery(query, true)
+	if err == nil || !strings.Contains(err.Error(), "Must provide a Service") {
 		t.Fatalf("bad: %v", err)
 	}
 
-	query.Token = "adf4238a-882b-9ddc-4a9d-5b6758e4159e"
-	if err := parseQuery(query); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	query.Service.Failover.NearestN = -1
-	err = parseQuery(query)
-	if err == nil || !strings.Contains(err.Error(), "Bad NearestN") {
+	query.Template.Type = ""
+	err = parseQuery(query, false)
+	if err == nil || !strings.Contains(err.Error(), "Must provide a Service") {
 		t.Fatalf("bad: %v", err)
 	}
 
-	query.Service.Failover.NearestN = 3
-	if err := parseQuery(query); err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	// None of the rest of these care about version 8 ACL enforcement.
+	for _, version8 := range []bool{true, false} {
+		query = &structs.PreparedQuery{}
+		query.Session = "adf4238a-882b-9ddc-4a9d-5b6758e4159e"
+		query.Service.Service = "foo"
+		if err := parseQuery(query, version8); err != nil {
+			t.Fatalf("err: %v", err)
+		}
 
-	query.DNS.TTL = "two fortnights"
-	err = parseQuery(query)
-	if err == nil || !strings.Contains(err.Error(), "Bad DNS TTL") {
-		t.Fatalf("bad: %v", err)
-	}
+		query.Token = redactedToken
+		err = parseQuery(query, version8)
+		if err == nil || !strings.Contains(err.Error(), "Bad Token") {
+			t.Fatalf("bad: %v", err)
+		}
 
-	query.DNS.TTL = "-3s"
-	err = parseQuery(query)
-	if err == nil || !strings.Contains(err.Error(), "must be >=0") {
-		t.Fatalf("bad: %v", err)
-	}
+		query.Token = "adf4238a-882b-9ddc-4a9d-5b6758e4159e"
+		if err := parseQuery(query, version8); err != nil {
+			t.Fatalf("err: %v", err)
+		}
 
-	query.DNS.TTL = "3s"
-	if err := parseQuery(query); err != nil {
-		t.Fatalf("err: %v", err)
+		query.Service.Failover.NearestN = -1
+		err = parseQuery(query, version8)
+		if err == nil || !strings.Contains(err.Error(), "Bad NearestN") {
+			t.Fatalf("bad: %v", err)
+		}
+
+		query.Service.Failover.NearestN = 3
+		if err := parseQuery(query, version8); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		query.DNS.TTL = "two fortnights"
+		err = parseQuery(query, version8)
+		if err == nil || !strings.Contains(err.Error(), "Bad DNS TTL") {
+			t.Fatalf("bad: %v", err)
+		}
+
+		query.DNS.TTL = "-3s"
+		err = parseQuery(query, version8)
+		if err == nil || !strings.Contains(err.Error(), "must be >=0") {
+			t.Fatalf("bad: %v", err)
+		}
+
+		query.DNS.TTL = "3s"
+		if err := parseQuery(query, version8); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		query.Service.NodeMeta = map[string]string{"": "somevalue"}
+		err = parseQuery(query, version8)
+		if err == nil || !strings.Contains(err.Error(), "cannot be blank") {
+			t.Fatalf("bad: %v", err)
+		}
+
+		query.Service.NodeMeta = map[string]string{"somekey": "somevalue"}
+		if err := parseQuery(query, version8); err != nil {
+			t.Fatalf("err: %v", err)
+		}
 	}
 }
 
@@ -592,7 +627,7 @@ func TestPreparedQuery_ACLDeny_Catchall_Template(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
 	// Create an ACL with write permissions for any prefix.
 	var token string
@@ -805,7 +840,7 @@ func TestPreparedQuery_Get(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
 	// Create an ACL with write permissions for redis queries.
 	var token string
@@ -917,9 +952,25 @@ func TestPreparedQuery_Get(t *testing.T) {
 		}
 	}
 
+	// Create a session.
+	var session string
+	{
+		req := structs.SessionRequest{
+			Datacenter: "dc1",
+			Op:         structs.SessionCreate,
+			Session: structs.Session{
+				Node: s1.config.NodeName,
+			},
+		}
+		if err := msgpackrpc.CallWithCodec(codec, "Session.Apply", &req, &session); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}
+
 	// Now update the query to take away its name.
 	query.Op = structs.PreparedQueryUpdate
 	query.Query.Name = ""
+	query.Query.Session = session
 	if err := msgpackrpc.CallWithCodec(codec, "PreparedQuery.Apply", &query, &reply); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1040,7 +1091,7 @@ func TestPreparedQuery_List(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
 	// Create an ACL with write permissions for redis queries.
 	var token string
@@ -1170,9 +1221,25 @@ func TestPreparedQuery_List(t *testing.T) {
 		}
 	}
 
+	// Create a session.
+	var session string
+	{
+		req := structs.SessionRequest{
+			Datacenter: "dc1",
+			Op:         structs.SessionCreate,
+			Session: structs.Session{
+				Node: s1.config.NodeName,
+			},
+		}
+		if err := msgpackrpc.CallWithCodec(codec, "Session.Apply", &req, &session); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}
+
 	// Now take away the query name.
 	query.Op = structs.PreparedQueryUpdate
 	query.Query.Name = ""
+	query.Query.Session = session
 	if err := msgpackrpc.CallWithCodec(codec, "PreparedQuery.Apply", &query, &reply); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1230,7 +1297,7 @@ func TestPreparedQuery_Explain(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 
 	// Create an ACL with write permissions for prod- queries.
 	var token string
@@ -1359,6 +1426,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 		c.ACLDatacenter = "dc1"
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
+		c.ACLEnforceVersion8 = false
 	})
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
@@ -1374,22 +1442,16 @@ func TestPreparedQuery_Execute(t *testing.T) {
 	codec2 := rpcClient(t, s2)
 	defer codec2.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
-	testutil.WaitForLeader(t, s2.RPC, "dc2")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s2.RPC, "dc2")
 
 	// Try to WAN join.
-	addr := fmt.Sprintf("127.0.0.1:%d",
-		s1.config.SerfWANConfig.MemberlistConfig.BindPort)
-	if _, err := s2.JoinWAN([]string{addr}); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	testutil.WaitForResult(
-		func() (bool, error) {
-			return len(s1.WANMembers()) > 1, nil
-		},
-		func(err error) {
-			t.Fatalf("Failed waiting for WAN join: %v", err)
-		})
+	joinWAN(t, s2, s1)
+	retry.Run(t, func(r *retry.R) {
+		if got, want := len(s1.WANMembers()), 2; got != want {
+			r.Fatalf("got %d WAN members want %d", got, want)
+		}
+	})
 
 	// Create an ACL with read permission to the service.
 	var execToken string
@@ -1423,12 +1485,19 @@ func TestPreparedQuery_Execute(t *testing.T) {
 					Datacenter: dc,
 					Node:       fmt.Sprintf("node%d", i+1),
 					Address:    fmt.Sprintf("127.0.0.%d", i+1),
+					NodeMeta: map[string]string{
+						"group":         fmt.Sprintf("%d", i/5),
+						"instance_type": "t2.micro",
+					},
 					Service: &structs.NodeService{
 						Service: "foo",
 						Port:    8000,
 						Tags:    []string{dc, fmt.Sprintf("tag%d", i+1)},
 					},
 					WriteRequest: structs.WriteRequest{Token: "root"},
+				}
+				if i == 0 {
+					req.NodeMeta["unique"] = "true"
 				}
 
 				var codec rpc.ClientCodec
@@ -1451,6 +1520,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 		Datacenter: "dc1",
 		Op:         structs.PreparedQueryCreate,
 		Query: &structs.PreparedQuery{
+			Name: "test",
 			Service: structs.ServiceQuery{
 				Service: "foo",
 			},
@@ -1524,6 +1594,72 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			!reflect.DeepEqual(reply.DNS, query.Query.DNS) ||
 			!reply.QueryMeta.KnownLeader {
 			t.Fatalf("bad: %v", reply)
+		}
+	}
+
+	// Run various service queries with node metadata filters.
+	if false {
+		cases := []struct {
+			filters  map[string]string
+			numNodes int
+		}{
+			{
+				filters:  map[string]string{},
+				numNodes: 10,
+			},
+			{
+				filters:  map[string]string{"instance_type": "t2.micro"},
+				numNodes: 10,
+			},
+			{
+				filters:  map[string]string{"group": "1"},
+				numNodes: 5,
+			},
+			{
+				filters:  map[string]string{"group": "0", "unique": "true"},
+				numNodes: 1,
+			},
+		}
+
+		for _, tc := range cases {
+			nodeMetaQuery := structs.PreparedQueryRequest{
+				Datacenter: "dc1",
+				Op:         structs.PreparedQueryCreate,
+				Query: &structs.PreparedQuery{
+					Service: structs.ServiceQuery{
+						Service:  "foo",
+						NodeMeta: tc.filters,
+					},
+					DNS: structs.QueryDNSOptions{
+						TTL: "10s",
+					},
+				},
+				WriteRequest: structs.WriteRequest{Token: "root"},
+			}
+			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Apply", &nodeMetaQuery, &nodeMetaQuery.Query.ID); err != nil {
+				t.Fatalf("err: %v", err)
+			}
+
+			req := structs.PreparedQueryExecuteRequest{
+				Datacenter:    "dc1",
+				QueryIDOrName: nodeMetaQuery.Query.ID,
+				QueryOptions:  structs.QueryOptions{Token: execToken},
+			}
+
+			var reply structs.PreparedQueryExecuteResponse
+			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
+				t.Fatalf("err: %v", err)
+			}
+
+			if len(reply.Nodes) != tc.numNodes {
+				t.Fatalf("bad: %v, %v", len(reply.Nodes), tc.numNodes)
+			}
+
+			for _, node := range reply.Nodes {
+				if !structs.SatisfiesMetaFilters(node.Node.Meta, tc.filters) {
+					t.Fatalf("bad: %v", node.Node.Meta)
+				}
+			}
 		}
 	}
 
@@ -1630,9 +1766,8 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			QueryOptions:  structs.QueryOptions{Token: execToken},
 		}
 
-		var reply structs.PreparedQueryExecuteResponse
-
 		for i := 0; i < 10; i++ {
+			var reply structs.PreparedQueryExecuteResponse
 			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -1665,10 +1800,9 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			QueryOptions:  structs.QueryOptions{Token: execToken},
 		}
 
-		var reply structs.PreparedQueryExecuteResponse
-
 		shuffled := false
 		for i := 0; i < 10; i++ {
+			var reply structs.PreparedQueryExecuteResponse
 			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -1699,9 +1833,8 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			QueryOptions:  structs.QueryOptions{Token: execToken},
 		}
 
-		var reply structs.PreparedQueryExecuteResponse
-
 		for i := 0; i < 10; i++ {
+			var reply structs.PreparedQueryExecuteResponse
 			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -1732,9 +1865,8 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			QueryOptions:  structs.QueryOptions{Token: execToken},
 		}
 
-		var reply structs.PreparedQueryExecuteResponse
-
 		for i := 0; i < 10; i++ {
+			var reply structs.PreparedQueryExecuteResponse
 			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -1761,12 +1893,11 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			QueryOptions:  structs.QueryOptions{Token: execToken},
 		}
 
-		var reply structs.PreparedQueryExecuteResponse
-
 		// Expect the set to be shuffled since we have no coordinates
 		// on the "foo" node.
 		shuffled := false
 		for i := 0; i < 10; i++ {
+			var reply structs.PreparedQueryExecuteResponse
 			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -1801,10 +1932,9 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			QueryOptions:  structs.QueryOptions{Token: execToken},
 		}
 
-		var reply structs.PreparedQueryExecuteResponse
-
 		shuffled := false
 		for i := 0; i < 10; i++ {
+			var reply structs.PreparedQueryExecuteResponse
 			if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -1851,7 +1981,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 			t.Fatalf("err: %v", err)
 		}
 	}
-	setHealth("node1", structs.HealthCritical)
+	setHealth("node1", api.HealthCritical)
 
 	// The failing node should be filtered.
 	{
@@ -1881,7 +2011,7 @@ func TestPreparedQuery_Execute(t *testing.T) {
 	}
 
 	// Upgrade it to a warning and re-query, should be 10 nodes again.
-	setHealth("node1", structs.HealthWarning)
+	setHealth("node1", api.HealthWarning)
 	{
 		req := structs.PreparedQueryExecuteRequest{
 			Datacenter:    "dc1",
@@ -2079,9 +2209,61 @@ func TestPreparedQuery_Execute(t *testing.T) {
 		}
 	}
 
+	// Turn on version 8 ACLs, which will start to filter even with the exec
+	// token.
+	s1.config.ACLEnforceVersion8 = true
+	{
+		req := structs.PreparedQueryExecuteRequest{
+			Datacenter:    "dc1",
+			QueryIDOrName: query.Query.ID,
+			QueryOptions:  structs.QueryOptions{Token: execToken},
+		}
+
+		var reply structs.PreparedQueryExecuteResponse
+		if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if len(reply.Nodes) != 0 ||
+			reply.Datacenter != "dc1" || reply.Failovers != 0 ||
+			reply.Service != query.Query.Service.Service ||
+			!reflect.DeepEqual(reply.DNS, query.Query.DNS) ||
+			!reply.QueryMeta.KnownLeader {
+			t.Fatalf("bad: %v", reply)
+		}
+	}
+
+	// Revert version 8 ACLs and make sure the query works again.
+	s1.config.ACLEnforceVersion8 = false
+	{
+		req := structs.PreparedQueryExecuteRequest{
+			Datacenter:    "dc1",
+			QueryIDOrName: query.Query.ID,
+			QueryOptions:  structs.QueryOptions{Token: execToken},
+		}
+
+		var reply structs.PreparedQueryExecuteResponse
+		if err := msgpackrpc.CallWithCodec(codec1, "PreparedQuery.Execute", &req, &reply); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if len(reply.Nodes) != 8 ||
+			reply.Datacenter != "dc1" || reply.Failovers != 0 ||
+			reply.Service != query.Query.Service.Service ||
+			!reflect.DeepEqual(reply.DNS, query.Query.DNS) ||
+			!reply.QueryMeta.KnownLeader {
+			t.Fatalf("bad: %v", reply)
+		}
+		for _, node := range reply.Nodes {
+			if node.Node.Node == "node1" || node.Node.Node == "node3" {
+				t.Fatalf("bad: %v", node)
+			}
+		}
+	}
+
 	// Now fail everything in dc1 and we should get an empty list back.
 	for i := 0; i < 10; i++ {
-		setHealth(fmt.Sprintf("node%d", i+1), structs.HealthCritical)
+		setHealth(fmt.Sprintf("node%d", i+1), api.HealthCritical)
 	}
 	{
 		req := structs.PreparedQueryExecuteRequest{
@@ -2274,14 +2456,10 @@ func TestPreparedQuery_Execute_ForwardLeader(t *testing.T) {
 	defer codec2.Close()
 
 	// Try to join.
-	addr := fmt.Sprintf("127.0.0.1:%d",
-		s1.config.SerfLANConfig.MemberlistConfig.BindPort)
-	if _, err := s2.JoinLAN([]string{addr}); err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	joinLAN(t, s2, s1)
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
-	testutil.WaitForLeader(t, s2.RPC, "dc1")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s2.RPC, "dc1")
 
 	// Use the follower as the client.
 	var codec rpc.ClientCodec
@@ -2314,6 +2492,7 @@ func TestPreparedQuery_Execute_ForwardLeader(t *testing.T) {
 		Datacenter: "dc1",
 		Op:         structs.PreparedQueryCreate,
 		Query: &structs.PreparedQuery{
+			Name: "test",
 			Service: structs.ServiceQuery{
 				Service: "redis",
 			},
@@ -2504,22 +2683,16 @@ func TestPreparedQuery_Wrapper(t *testing.T) {
 	codec2 := rpcClient(t, s2)
 	defer codec2.Close()
 
-	testutil.WaitForLeader(t, s1.RPC, "dc1")
-	testutil.WaitForLeader(t, s2.RPC, "dc2")
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s2.RPC, "dc2")
 
 	// Try to WAN join.
-	addr := fmt.Sprintf("127.0.0.1:%d",
-		s1.config.SerfWANConfig.MemberlistConfig.BindPort)
-	if _, err := s2.JoinWAN([]string{addr}); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	testutil.WaitForResult(
-		func() (bool, error) {
-			return len(s1.WANMembers()) > 1, nil
-		},
-		func(err error) {
-			t.Fatalf("Failed waiting for WAN join: %v", err)
-		})
+	joinWAN(t, s2, s1)
+	retry.Run(t, func(r *retry.R) {
+		if got, want := len(s1.WANMembers()), 2; got != want {
+			r.Fatalf("got %d WAN members want %d", got, want)
+		}
+	})
 
 	// Try all the operations on a real server via the wrapper.
 	wrapper := &queryServerWrapper{s1}
@@ -2570,13 +2743,13 @@ func (m *mockQueryServer) ForwardDC(method, dc string, args interface{}, reply i
 	}
 	if m.QueryFn != nil {
 		return m.QueryFn(dc, args, reply)
-	} else {
-		return nil
 	}
+	return nil
 }
 
 func TestPreparedQuery_queryFailover(t *testing.T) {
 	query := &structs.PreparedQuery{
+		Name: "test",
 		Service: structs.ServiceQuery{
 			Failover: structs.QueryDatacenterOptions{
 				NearestN:    0,

@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/testutil/retry"
 )
 
 func TestEventFire(t *testing.T) {
@@ -122,31 +123,28 @@ func TestEventList(t *testing.T) {
 			t.Fatalf("err: %v", err)
 		}
 
-		testutil.WaitForResult(func() (bool, error) {
+		retry.Run(t, func(r *retry.R) {
 			req, err := http.NewRequest("GET", "/v1/event/list", nil)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			resp := httptest.NewRecorder()
 			obj, err := srv.EventList(resp, req)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 
 			list, ok := obj.([]*UserEvent)
 			if !ok {
-				return false, fmt.Errorf("bad: %#v", obj)
+				r.Fatalf("bad: %#v", obj)
 			}
 			if len(list) != 1 || list[0].Name != "test" {
-				return false, fmt.Errorf("bad: %#v", list)
+				r.Fatalf("bad: %#v", list)
 			}
 			header := resp.Header().Get("X-Consul-Index")
 			if header == "" || header == "0" {
-				return false, fmt.Errorf("bad: %#v", header)
+				r.Fatalf("bad: %#v", header)
 			}
-			return true, nil
-		}, func(err error) {
-			t.Fatalf("err: %v", err)
 		})
 	})
 }
@@ -163,33 +161,89 @@ func TestEventList_Filter(t *testing.T) {
 			t.Fatalf("err: %v", err)
 		}
 
-		testutil.WaitForResult(func() (bool, error) {
+		retry.Run(t, func(r *retry.R) {
 			req, err := http.NewRequest("GET", "/v1/event/list?name=foo", nil)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			resp := httptest.NewRecorder()
 			obj, err := srv.EventList(resp, req)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 
 			list, ok := obj.([]*UserEvent)
 			if !ok {
-				return false, fmt.Errorf("bad: %#v", obj)
+				r.Fatalf("bad: %#v", obj)
 			}
 			if len(list) != 1 || list[0].Name != "foo" {
-				return false, fmt.Errorf("bad: %#v", list)
+				r.Fatalf("bad: %#v", list)
 			}
 			header := resp.Header().Get("X-Consul-Index")
 			if header == "" || header == "0" {
-				return false, fmt.Errorf("bad: %#v", header)
+				r.Fatalf("bad: %#v", header)
 			}
-			return true, nil
-		}, func(err error) {
-			t.Fatalf("err: %v", err)
 		})
 	})
+}
+
+func TestEventList_ACLFilter(t *testing.T) {
+	dir, srv := makeHTTPServerWithACLs(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Fire an event.
+	p := &UserEvent{Name: "foo"}
+	if err := srv.agent.UserEvent("dc1", "root", p); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Try no token.
+	{
+		retry.Run(t, func(r *retry.R) {
+			req, err := http.NewRequest("GET", "/v1/event/list", nil)
+			if err != nil {
+				r.Fatal(err)
+			}
+			resp := httptest.NewRecorder()
+			obj, err := srv.EventList(resp, req)
+			if err != nil {
+				r.Fatal(err)
+			}
+
+			list, ok := obj.([]*UserEvent)
+			if !ok {
+				r.Fatalf("bad: %#v", obj)
+			}
+			if len(list) != 0 {
+				r.Fatalf("bad: %#v", list)
+			}
+		})
+	}
+
+	// Try the root token.
+	{
+		retry.Run(t, func(r *retry.R) {
+			req, err := http.NewRequest("GET", "/v1/event/list?token=root", nil)
+			if err != nil {
+				r.Fatal(err)
+			}
+			resp := httptest.NewRecorder()
+			obj, err := srv.EventList(resp, req)
+			if err != nil {
+				r.Fatal(err)
+			}
+
+			list, ok := obj.([]*UserEvent)
+			if !ok {
+				r.Fatalf("bad: %#v", obj)
+			}
+			if len(list) != 1 || list[0].Name != "foo" {
+				r.Fatalf("bad: %#v", list)
+			}
+		})
+	}
 }
 
 func TestEventList_Blocking(t *testing.T) {
@@ -200,24 +254,21 @@ func TestEventList_Blocking(t *testing.T) {
 		}
 
 		var index string
-		testutil.WaitForResult(func() (bool, error) {
+		retry.Run(t, func(r *retry.R) {
 			req, err := http.NewRequest("GET", "/v1/event/list", nil)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			resp := httptest.NewRecorder()
 			_, err = srv.EventList(resp, req)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			header := resp.Header().Get("X-Consul-Index")
 			if header == "" || header == "0" {
-				return false, fmt.Errorf("bad: %#v", header)
+				r.Fatalf("bad: %#v", header)
 			}
 			index = header
-			return true, nil
-		}, func(err error) {
-			t.Fatalf("err: %v", err)
 		})
 
 		go func() {
@@ -228,28 +279,25 @@ func TestEventList_Blocking(t *testing.T) {
 			}
 		}()
 
-		testutil.WaitForResult(func() (bool, error) {
+		retry.Run(t, func(r *retry.R) {
 			url := "/v1/event/list?index=" + index
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			resp := httptest.NewRecorder()
 			obj, err := srv.EventList(resp, req)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 
 			list, ok := obj.([]*UserEvent)
 			if !ok {
-				return false, fmt.Errorf("bad: %#v", obj)
+				r.Fatalf("bad: %#v", obj)
 			}
 			if len(list) != 2 || list[1].Name != "second" {
-				return false, fmt.Errorf("bad: %#v", list)
+				r.Fatalf("bad: %#v", list)
 			}
-			return true, nil
-		}, func(err error) {
-			t.Fatalf("err: %v", err)
 		})
 	})
 }
@@ -270,30 +318,26 @@ func TestEventList_EventBufOrder(t *testing.T) {
 				t.Fatalf("err: %v", err)
 			}
 		}
-
 		// Test that the event order is preserved when name
 		// filtering on a list of > 1 matching event.
-		testutil.WaitForResult(func() (bool, error) {
+		retry.Run(t, func(r *retry.R) {
 			url := "/v1/event/list?name=foo"
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			resp := httptest.NewRecorder()
 			obj, err := srv.EventList(resp, req)
 			if err != nil {
-				return false, err
+				r.Fatal(err)
 			}
 			list, ok := obj.([]*UserEvent)
 			if !ok {
-				return false, fmt.Errorf("bad: %#v", obj)
+				r.Fatalf("bad: %#v", obj)
 			}
 			if len(list) != 3 || list[2].ID != expected.ID {
-				return false, fmt.Errorf("bad: %#v", list)
+				r.Fatalf("bad: %#v", list)
 			}
-			return true, nil
-		}, func(err error) {
-			t.Fatalf("err: %v", err)
 		})
 	})
 }

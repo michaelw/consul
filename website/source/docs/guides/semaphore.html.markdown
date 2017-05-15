@@ -3,13 +3,13 @@ layout: "docs"
 page_title: "Semaphore"
 sidebar_current: "docs-guides-semaphore"
 description: |-
-  This guide demonstrates how to implement a distributed semaphore using the Consul Key/Value store.
+  This guide demonstrates how to implement a distributed semaphore using the Consul KV store.
 ---
 
 # Semaphore
 
 This guide demonstrates how to implement a distributed semaphore using the Consul
-Key/Value store. This is useful when you want to coordinate many services while
+KV store. This is useful when you want to coordinate many services while
 restricting access to certain resources.
 
 ~>  If you only need mutual exclusion or leader election,
@@ -21,14 +21,13 @@ cover all the possible methods. Instead, we will focus on using Consul's support
 [sessions](/docs/internals/sessions.html). Sessions allow us to build a system that
 can gracefully handle failures.
 
-Note that JSON output in this guide has been pretty-printed for easier
-reading.  Actual values returned from the API will not be formatted.
+-> **Note:** JSON output in this guide has been pretty-printed for easier reading. Actual values returned from the API will not be formatted.
 
 ## Contending Nodes
 
 Let's imagine we have a set of nodes who are attempting to acquire a slot in the
 semaphore. All nodes that are participating should agree on three decisions: the
-prefix in the Key/Value store used to coordinate, a single key to use as a lock,
+prefix in the KV store used to coordinate, a single key to use as a lock,
 and a limit on the number of slot holders.
 
 For the prefix we will be using for coordination, a good pattern is simply:
@@ -40,7 +39,7 @@ service/<service name>/lock/
 We'll abbreviate this pattern as simply `<prefix>` for the rest of this guide.
 
 The first step is to create a session. This is done using the
-[Session HTTP API](/docs/agent/http/session.html#session_create):
+[Session HTTP API](/api/session.html#session_create):
 
 ```text
 curl  -X PUT -d '{"Name": "dbservice"}' \
@@ -67,7 +66,7 @@ curl -X PUT -d <body> http://localhost:8500/v1/kv/<prefix>/<session>?acquire=<se
  ```
 
 The `<session>` value is the ID returned by the call to
-[`/v1/session/create`](/docs/agent/http/session.html#session_create).
+[`/v1/session/create`](/api/session.html#session_create).
 
 `body` can be used to associate a meaningful value with the contender. This is opaque
 to Consul but can be useful for human operators.
@@ -130,7 +129,7 @@ has not declared the node unhealthy. Additional checks can be specified if desir
 
 Watching for changes is done via a blocking query against `<prefix>`. If a contender
 holds a slot, then on any change the `<lock>` should be re-checked to ensure the slot is
-still held.  If no slot is held, then the same acquisition logic is triggered to check
+still held. If no slot is held, then the same acquisition logic is triggered to check
 and potentially re-attempt acquisition. This allows a contender to steal the slot from
 a failed contender or one that has voluntarily released its slot.
 

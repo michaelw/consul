@@ -1,10 +1,8 @@
 package agent
 
 import (
-	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -18,18 +16,15 @@ import (
 	"github.com/armon/go-metrics"
 	"github.com/armon/go-metrics/circonus"
 	"github.com/armon/go-metrics/datadog"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/defaults"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/hashicorp/consul/command/base"
+	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/logger"
 	"github.com/hashicorp/consul/watch"
 	"github.com/hashicorp/go-checkpoint"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/logutils"
-	scada "github.com/hashicorp/scada-client/scada"
+	"github.com/hashicorp/scada-client/scada"
 	"github.com/mitchellh/cli"
 )
 
@@ -44,21 +39,21 @@ var validDatacenter = regexp.MustCompile("^[a-zA-Z0-9_-]+$")
 // ShutdownCh. If two messages are sent on the ShutdownCh it will forcibly
 // exit.
 type Command struct {
+	base.Command
 	Revision          string
 	Version           string
 	VersionPrerelease string
 	HumanVersion      string
-	Ui                cli.Ui
 	ShutdownCh        <-chan struct{}
+	configReloadCh    chan chan error
 	args              []string
 	logFilter         *logutils.LevelFilter
 	logOutput         io.Writer
 	agent             *Agent
-	rpcServer         *AgentRPC
 	httpServers       []*HTTPServer
 	dnsServer         *DNSServer
 	scadaProvider     *scada.Provider
-	scadaHttp         *HTTPServer
+	scadaHTTP         *HTTPServer
 }
 
 // readConfig is responsible for setup of our configuration using
@@ -71,80 +66,117 @@ func (c *Command) readConfig() *Config {
 	var dnsRecursors []string
 	var dev bool
 	var dcDeprecated string
-	cmdFlags := flag.NewFlagSet("agent", flag.ContinueOnError)
-	cmdFlags.Usage = func() { c.Ui.Output(c.Help()) }
+	var nodeMeta []string
 
-	cmdFlags.Var((*AppendSliceValue)(&configFiles), "config-file", "json file to read config from")
-	cmdFlags.Var((*AppendSliceValue)(&configFiles), "config-dir", "directory of json files to read")
-	cmdFlags.Var((*AppendSliceValue)(&dnsRecursors), "recursor", "address of an upstream DNS server")
-	cmdFlags.BoolVar(&dev, "dev", false, "development server mode")
+	f := c.Command.NewFlagSet(c)
 
-	cmdFlags.StringVar(&cmdConfig.LogLevel, "log-level", "", "log level")
-	cmdFlags.StringVar(&cmdConfig.NodeName, "node", "", "node name")
-	cmdFlags.StringVar(&dcDeprecated, "dc", "", "node datacenter (deprecated: use 'datacenter' instead)")
-	cmdFlags.StringVar(&cmdConfig.Datacenter, "datacenter", "", "node datacenter")
-	cmdFlags.StringVar(&cmdConfig.DataDir, "data-dir", "", "path to the data directory")
-	cmdFlags.BoolVar(&cmdConfig.EnableUi, "ui", false, "enable the built-in web UI")
-	cmdFlags.StringVar(&cmdConfig.UiDir, "ui-dir", "", "path to the web UI directory")
-	cmdFlags.StringVar(&cmdConfig.PidFile, "pid-file", "", "path to file to store PID")
-	cmdFlags.StringVar(&cmdConfig.EncryptKey, "encrypt", "", "gossip encryption key")
+	f.Var((*AppendSliceValue)(&configFiles), "config-file",
+		"Path to a JSON file to read configuration from. This can be specified multiple times.")
+	f.Var((*AppendSliceValue)(&configFiles), "config-dir",
+		"Path to a directory to read configuration files from. This will read every file ending "+
+			"in '.json' as configuration in this directory in alphabetical order. This can be "+
+			"specified multiple times.")
+	f.Var((*AppendSliceValue)(&dnsRecursors), "recursor",
+		"Address of an upstream DNS server. Can be specified multiple times.")
+	f.Var((*AppendSliceValue)(&nodeMeta), "node-meta",
+		"An arbitrary metadata key/value pair for this node, of the format `key:value`. Can be specified multiple times.")
+	f.BoolVar(&dev, "dev", false, "Starts the agent in development mode.")
 
-	cmdFlags.BoolVar(&cmdConfig.Server, "server", false, "run agent as server")
-	cmdFlags.BoolVar(&cmdConfig.Bootstrap, "bootstrap", false, "enable server bootstrap mode")
-	cmdFlags.IntVar(&cmdConfig.BootstrapExpect, "bootstrap-expect", 0, "enable automatic bootstrap via expect mode")
-	cmdFlags.StringVar(&cmdConfig.Domain, "domain", "", "domain to use for DNS interface")
+	f.StringVar(&cmdConfig.LogLevel, "log-level", "", "Log level of the agent.")
+	f.StringVar(&cmdConfig.NodeName, "node", "", "Name of this node. Must be unique in the cluster.")
+	f.StringVar((*string)(&cmdConfig.NodeID), "node-id", "",
+		"A unique ID for this node across space and time. Defaults to a randomly-generated ID"+
+			" that persists in the data-dir.")
+	f.BoolVar(&cmdConfig.DisableHostNodeID, "disable-host-node-id", false,
+		"Setting this to true will prevent Consul from using information from the"+
+			" host to generate a node ID, and will cause Consul to generate a"+
+			" random node ID instead.")
+	f.StringVar(&dcDeprecated, "dc", "", "Datacenter of the agent (deprecated: use 'datacenter' instead).")
+	f.StringVar(&cmdConfig.Datacenter, "datacenter", "", "Datacenter of the agent.")
+	f.StringVar(&cmdConfig.DataDir, "data-dir", "", "Path to a data directory to store agent state.")
+	f.BoolVar(&cmdConfig.EnableUI, "ui", false, "Enables the built-in static web UI server.")
+	f.StringVar(&cmdConfig.UIDir, "ui-dir", "", "Path to directory containing the web UI resources.")
+	f.StringVar(&cmdConfig.PidFile, "pid-file", "", "Path to file to store agent PID.")
+	f.StringVar(&cmdConfig.EncryptKey, "encrypt", "", "Provides the gossip encryption key.")
 
-	cmdFlags.StringVar(&cmdConfig.ClientAddr, "client", "", "address to bind client listeners to (DNS, HTTP, HTTPS, RPC)")
-	cmdFlags.StringVar(&cmdConfig.BindAddr, "bind", "", "address to bind server listeners to")
-	cmdFlags.StringVar(&cmdConfig.SerfWanBindAddr, "serf-wan-bind", "", "address to bind Serf WAN listeners to")
-	cmdFlags.StringVar(&cmdConfig.SerfLanBindAddr, "serf-lan-bind", "", "address to bind Serf LAN listeners to")
-	cmdFlags.IntVar(&cmdConfig.Ports.HTTP, "http-port", 0, "http port to use")
-	cmdFlags.IntVar(&cmdConfig.Ports.DNS, "dns-port", 0, "DNS port to use")
-	cmdFlags.StringVar(&cmdConfig.AdvertiseAddr, "advertise", "", "address to advertise instead of bind addr")
-	cmdFlags.StringVar(&cmdConfig.AdvertiseAddrWan, "advertise-wan", "", "address to advertise on wan instead of bind or advertise addr")
+	f.BoolVar(&cmdConfig.Server, "server", false, "Switches agent to server mode.")
+	f.BoolVar(&cmdConfig.NonVotingServer, "non-voting-server", false,
+		"(Enterprise-only) This flag is used to make the server not participate in the Raft quorum, "+
+			"and have it only receive the data replication stream. This can be used to add read scalability "+
+			"to a cluster in cases where a high volume of reads to servers are needed.")
+	f.BoolVar(&cmdConfig.Bootstrap, "bootstrap", false, "Sets server to bootstrap mode.")
+	f.IntVar(&cmdConfig.BootstrapExpect, "bootstrap-expect", 0, "Sets server to expect bootstrap mode.")
+	f.StringVar(&cmdConfig.Domain, "domain", "", "Domain to use for DNS interface.")
 
-	cmdFlags.StringVar(&cmdConfig.AtlasInfrastructure, "atlas", "", "infrastructure name in Atlas")
-	cmdFlags.StringVar(&cmdConfig.AtlasToken, "atlas-token", "", "authentication token for Atlas")
-	cmdFlags.BoolVar(&cmdConfig.AtlasJoin, "atlas-join", false, "auto-join with Atlas")
-	cmdFlags.StringVar(&cmdConfig.AtlasEndpoint, "atlas-endpoint", "", "endpoint for Atlas integration")
+	f.StringVar(&cmdConfig.ClientAddr, "client", "",
+		"Sets the address to bind for client access. This includes RPC, DNS, HTTP and HTTPS (if configured).")
+	f.StringVar(&cmdConfig.BindAddr, "bind", "", "Sets the bind address for cluster communication.")
+	f.StringVar(&cmdConfig.SerfWanBindAddr, "serf-wan-bind", "", "Address to bind Serf WAN listeners to.")
+	f.StringVar(&cmdConfig.SerfLanBindAddr, "serf-lan-bind", "", "Address to bind Serf LAN listeners to.")
+	f.IntVar(&cmdConfig.Ports.HTTP, "http-port", 0, "Sets the HTTP API port to listen on.")
+	f.IntVar(&cmdConfig.Ports.DNS, "dns-port", 0, "DNS port to use.")
+	f.StringVar(&cmdConfig.AdvertiseAddr, "advertise", "", "Sets the advertise address to use.")
+	f.StringVar(&cmdConfig.AdvertiseAddrWan, "advertise-wan", "",
+		"Sets address to advertise on WAN instead of -advertise address.")
 
-	cmdFlags.IntVar(&cmdConfig.Protocol, "protocol", -1, "protocol version")
+	f.StringVar(&cmdConfig.AtlasInfrastructure, "atlas", "",
+		"(deprecated) Sets the Atlas infrastructure name, enables SCADA.")
+	f.StringVar(&cmdConfig.AtlasToken, "atlas-token", "",
+		"(deprecated) Provides the Atlas API token.")
+	f.BoolVar(&cmdConfig.AtlasJoin, "atlas-join", false,
+		"(deprecated) Enables auto-joining the Atlas cluster.")
+	f.StringVar(&cmdConfig.AtlasEndpoint, "atlas-endpoint", "",
+		"(deprecated) The address of the endpoint for Atlas integration.")
 
-	cmdFlags.BoolVar(&cmdConfig.EnableSyslog, "syslog", false,
-		"enable logging to syslog facility")
-	cmdFlags.BoolVar(&cmdConfig.RejoinAfterLeave, "rejoin", false,
-		"enable re-joining after a previous leave")
-	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.StartJoin), "join",
-		"address of agent to join on startup")
-	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.StartJoinWan), "join-wan",
-		"address of agent to join -wan on startup")
-	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.RetryJoin), "retry-join",
-		"address of agent to join on startup with retry")
-	cmdFlags.IntVar(&cmdConfig.RetryMaxAttempts, "retry-max", 0,
-		"number of retries for joining")
-	cmdFlags.StringVar(&retryInterval, "retry-interval", "",
-		"interval between join attempts")
-	cmdFlags.StringVar(&cmdConfig.RetryJoinEC2.Region, "retry-join-ec2-region", "",
-		"EC2 Region to discover servers in")
-	cmdFlags.StringVar(&cmdConfig.RetryJoinEC2.TagKey, "retry-join-ec2-tag-key", "",
-		"EC2 tag key to filter on for server discovery")
-	cmdFlags.StringVar(&cmdConfig.RetryJoinEC2.TagValue, "retry-join-ec2-tag-value", "",
-		"EC2 tag value to filter on for server discovery")
-	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.RetryJoinWan), "retry-join-wan",
-		"address of agent to join -wan on startup with retry")
-	cmdFlags.IntVar(&cmdConfig.RetryMaxAttemptsWan, "retry-max-wan", 0,
-		"number of retries for joining -wan")
-	cmdFlags.StringVar(&retryIntervalWan, "retry-interval-wan", "",
-		"interval between join -wan attempts")
+	f.IntVar(&cmdConfig.Protocol, "protocol", -1,
+		"Sets the protocol version. Defaults to latest.")
+	f.IntVar(&cmdConfig.RaftProtocol, "raft-protocol", -1,
+		"Sets the Raft protocol version. Defaults to latest.")
 
-	if err := cmdFlags.Parse(c.args); err != nil {
+	f.BoolVar(&cmdConfig.EnableSyslog, "syslog", false,
+		"Enables logging to syslog.")
+	f.BoolVar(&cmdConfig.RejoinAfterLeave, "rejoin", false,
+		"Ignores a previous leave and attempts to rejoin the cluster.")
+	f.Var((*AppendSliceValue)(&cmdConfig.StartJoin), "join",
+		"Address of an agent to join at start time. Can be specified multiple times.")
+	f.Var((*AppendSliceValue)(&cmdConfig.StartJoinWan), "join-wan",
+		"Address of an agent to join -wan at start time. Can be specified multiple times.")
+	f.Var((*AppendSliceValue)(&cmdConfig.RetryJoin), "retry-join",
+		"Address of an agent to join at start time with retries enabled. Can be specified multiple times.")
+	f.IntVar(&cmdConfig.RetryMaxAttempts, "retry-max", 0,
+		"Maximum number of join attempts. Defaults to 0, which will retry indefinitely.")
+	f.StringVar(&retryInterval, "retry-interval", "",
+		"Time to wait between join attempts.")
+	f.StringVar(&cmdConfig.RetryJoinEC2.Region, "retry-join-ec2-region", "",
+		"EC2 Region to discover servers in.")
+	f.StringVar(&cmdConfig.RetryJoinEC2.TagKey, "retry-join-ec2-tag-key", "",
+		"EC2 tag key to filter on for server discovery.")
+	f.StringVar(&cmdConfig.RetryJoinEC2.TagValue, "retry-join-ec2-tag-value", "",
+		"EC2 tag value to filter on for server discovery.")
+	f.StringVar(&cmdConfig.RetryJoinGCE.ProjectName, "retry-join-gce-project-name", "",
+		"Google Compute Engine project to discover servers in.")
+	f.StringVar(&cmdConfig.RetryJoinGCE.ZonePattern, "retry-join-gce-zone-pattern", "",
+		"Google Compute Engine region or zone to discover servers in (regex pattern).")
+	f.StringVar(&cmdConfig.RetryJoinGCE.TagValue, "retry-join-gce-tag-value", "",
+		"Google Compute Engine tag value to filter on for server discovery.")
+	f.StringVar(&cmdConfig.RetryJoinGCE.CredentialsFile, "retry-join-gce-credentials-file", "",
+		"Path to credentials JSON file to use with Google Compute Engine.")
+	f.Var((*AppendSliceValue)(&cmdConfig.RetryJoinWan), "retry-join-wan",
+		"Address of an agent to join -wan at start time with retries enabled. "+
+			"Can be specified multiple times.")
+	f.IntVar(&cmdConfig.RetryMaxAttemptsWan, "retry-max-wan", 0,
+		"Maximum number of join -wan attempts. Defaults to 0, which will retry indefinitely.")
+	f.StringVar(&retryIntervalWan, "retry-interval-wan", "",
+		"Time to wait between join -wan attempts.")
+
+	if err := c.Command.Parse(c.args); err != nil {
 		return nil
 	}
 
 	if retryInterval != "" {
 		dur, err := time.ParseDuration(retryInterval)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error: %s", err))
+			c.UI.Error(fmt.Sprintf("Error: %s", err))
 			return nil
 		}
 		cmdConfig.RetryInterval = dur
@@ -153,10 +185,18 @@ func (c *Command) readConfig() *Config {
 	if retryIntervalWan != "" {
 		dur, err := time.ParseDuration(retryIntervalWan)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error: %s", err))
+			c.UI.Error(fmt.Sprintf("Error: %s", err))
 			return nil
 		}
 		cmdConfig.RetryIntervalWan = dur
+	}
+
+	if len(nodeMeta) > 0 {
+		cmdConfig.Meta = make(map[string]string)
+		for _, entry := range nodeMeta {
+			key, value := parseMetaPair(entry)
+			cmdConfig.Meta[key] = value
+		}
 	}
 
 	var config *Config
@@ -169,7 +209,7 @@ func (c *Command) readConfig() *Config {
 	if len(configFiles) > 0 {
 		fileConfig, err := ReadConfigPaths(configFiles)
 		if err != nil {
-			c.Ui.Error(err.Error())
+			c.UI.Error(err.Error())
 			return nil
 		}
 
@@ -183,14 +223,14 @@ func (c *Command) readConfig() *Config {
 	if config.NodeName == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error determining node name: %s", err))
+			c.UI.Error(fmt.Sprintf("Error determining node name: %s", err))
 			return nil
 		}
 		config.NodeName = hostname
 	}
 	config.NodeName = strings.TrimSpace(config.NodeName)
 	if config.NodeName == "" {
-		c.Ui.Error("Node name can not be empty")
+		c.UI.Error("Node name can not be empty")
 		return nil
 	}
 
@@ -203,15 +243,27 @@ func (c *Command) readConfig() *Config {
 		config.SkipLeaveOnInt = Bool(config.Server)
 	}
 
-	// Ensure we have a data directory
-	if config.DataDir == "" && !dev {
-		c.Ui.Error("Must specify data directory using -data-dir")
-		return nil
+	// Ensure we have a data directory if we are not in dev mode.
+	if !dev {
+		if config.DataDir == "" {
+			c.UI.Error("Must specify data directory using -data-dir")
+			return nil
+		}
+
+		if finfo, err := os.Stat(config.DataDir); err != nil {
+			if !os.IsNotExist(err) {
+				c.UI.Error(fmt.Sprintf("Error getting data-dir: %s", err))
+				return nil
+			}
+		} else if !finfo.IsDir() {
+			c.UI.Error(fmt.Sprintf("The data-dir specified at %q is not a directory", config.DataDir))
+			return nil
+		}
 	}
 
 	// Ensure all endpoints are unique
 	if err := config.verifyUniqueListeners(); err != nil {
-		c.Ui.Error(fmt.Sprintf("All listening endpoints must be unique: %s", err))
+		c.UI.Error(fmt.Sprintf("All listening endpoints must be unique: %s", err))
 		return nil
 	}
 
@@ -222,43 +274,43 @@ func (c *Command) readConfig() *Config {
 		mdbPath := filepath.Join(config.DataDir, "mdb")
 		if _, err := os.Stat(mdbPath); !os.IsNotExist(err) {
 			if os.IsPermission(err) {
-				c.Ui.Error(fmt.Sprintf("CRITICAL: Permission denied for data folder at %q!", mdbPath))
-				c.Ui.Error("Consul will refuse to boot without access to this directory.")
-				c.Ui.Error("Please correct permissions and try starting again.")
+				c.UI.Error(fmt.Sprintf("CRITICAL: Permission denied for data folder at %q!", mdbPath))
+				c.UI.Error("Consul will refuse to boot without access to this directory.")
+				c.UI.Error("Please correct permissions and try starting again.")
 				return nil
 			}
-			c.Ui.Error(fmt.Sprintf("CRITICAL: Deprecated data folder found at %q!", mdbPath))
-			c.Ui.Error("Consul will refuse to boot with this directory present.")
-			c.Ui.Error("See https://www.consul.io/docs/upgrade-specific.html for more information.")
+			c.UI.Error(fmt.Sprintf("CRITICAL: Deprecated data folder found at %q!", mdbPath))
+			c.UI.Error("Consul will refuse to boot with this directory present.")
+			c.UI.Error("See https://www.consul.io/docs/upgrade-specific.html for more information.")
 			return nil
 		}
 	}
 
 	// Verify DNS settings
 	if config.DNSConfig.UDPAnswerLimit < 1 {
-		c.Ui.Error(fmt.Sprintf("dns_config.udp_answer_limit %d too low, must always be greater than zero", config.DNSConfig.UDPAnswerLimit))
+		c.UI.Error(fmt.Sprintf("dns_config.udp_answer_limit %d too low, must always be greater than zero", config.DNSConfig.UDPAnswerLimit))
 	}
 
 	if config.EncryptKey != "" {
 		if _, err := config.EncryptBytes(); err != nil {
-			c.Ui.Error(fmt.Sprintf("Invalid encryption key: %s", err))
+			c.UI.Error(fmt.Sprintf("Invalid encryption key: %s", err))
 			return nil
 		}
 		keyfileLAN := filepath.Join(config.DataDir, serfLANKeyring)
 		if _, err := os.Stat(keyfileLAN); err == nil {
-			c.Ui.Error("WARNING: LAN keyring exists but -encrypt given, using keyring")
+			c.UI.Error("WARNING: LAN keyring exists but -encrypt given, using keyring")
 		}
 		if config.Server {
 			keyfileWAN := filepath.Join(config.DataDir, serfWANKeyring)
 			if _, err := os.Stat(keyfileWAN); err == nil {
-				c.Ui.Error("WARNING: WAN keyring exists but -encrypt given, using keyring")
+				c.UI.Error("WARNING: WAN keyring exists but -encrypt given, using keyring")
 			}
 		}
 	}
 
 	// Output a warning if the 'dc' flag has been used.
 	if dcDeprecated != "" {
-		c.Ui.Error("WARNING: the 'dc' flag has been deprecated. Use 'datacenter' instead")
+		c.UI.Error("WARNING: the 'dc' flag has been deprecated. Use 'datacenter' instead")
 
 		// Making sure that we don't break previous versions.
 		config.Datacenter = dcDeprecated
@@ -270,7 +322,7 @@ func (c *Command) readConfig() *Config {
 
 	// Verify datacenter is valid
 	if !validDatacenter.MatchString(config.Datacenter) {
-		c.Ui.Error("Datacenter must be alpha-numeric with underscores and hypens only")
+		c.UI.Error("Datacenter must be alpha-numeric with underscores and hypens only")
 		return nil
 	}
 
@@ -280,32 +332,42 @@ func (c *Command) readConfig() *Config {
 
 		// Verify 'acl_datacenter' is valid
 		if !validDatacenter.MatchString(config.ACLDatacenter) {
-			c.Ui.Error("ACL datacenter must be alpha-numeric with underscores and hypens only")
+			c.UI.Error("ACL datacenter must be alpha-numeric with underscores and hypens only")
 			return nil
 		}
 	}
 
 	// Only allow bootstrap mode when acting as a server
 	if config.Bootstrap && !config.Server {
-		c.Ui.Error("Bootstrap mode cannot be enabled when server mode is not enabled")
+		c.UI.Error("Bootstrap mode cannot be enabled when server mode is not enabled")
 		return nil
 	}
 
 	// Expect can only work when acting as a server
 	if config.BootstrapExpect != 0 && !config.Server {
-		c.Ui.Error("Expect mode cannot be enabled when server mode is not enabled")
+		c.UI.Error("Expect mode cannot be enabled when server mode is not enabled")
 		return nil
 	}
 
 	// Expect can only work when dev mode is off
 	if config.BootstrapExpect > 0 && config.DevMode {
-		c.Ui.Error("Expect mode cannot be enabled when dev mode is enabled")
+		c.UI.Error("Expect mode cannot be enabled when dev mode is enabled")
 		return nil
 	}
 
 	// Expect & Bootstrap are mutually exclusive
 	if config.BootstrapExpect != 0 && config.Bootstrap {
-		c.Ui.Error("Bootstrap cannot be provided with an expected server count")
+		c.UI.Error("Bootstrap cannot be provided with an expected server count")
+		return nil
+	}
+
+	if isAddrANY(config.AdvertiseAddr) {
+		c.UI.Error("Advertise address cannot be " + config.AdvertiseAddr)
+		return nil
+	}
+
+	if isAddrANY(config.AdvertiseAddrWan) {
+		c.UI.Error("Advertise WAN address cannot be " + config.AdvertiseAddrWan)
 		return nil
 	}
 
@@ -314,13 +376,13 @@ func (c *Command) readConfig() *Config {
 		// Parse the watches, excluding the handler
 		wp, err := watch.ParseExempt(params, []string{"handler"})
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to parse watch (%#v): %v", params, err))
+			c.UI.Error(fmt.Sprintf("Failed to parse watch (%#v): %v", params, err))
 			return nil
 		}
 
 		// Get the handler
 		if err := verifyWatchHandler(wp.Exempt["handler"]); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to setup watch handler (%#v): %v", params, err))
+			c.UI.Error(fmt.Sprintf("Failed to setup watch handler (%#v): %v", params, err))
 			return nil
 		}
 
@@ -330,24 +392,43 @@ func (c *Command) readConfig() *Config {
 
 	// Warn if we are in expect mode
 	if config.BootstrapExpect == 1 {
-		c.Ui.Error("WARNING: BootstrapExpect Mode is specified as 1; this is the same as Bootstrap mode.")
+		c.UI.Error("WARNING: BootstrapExpect Mode is specified as 1; this is the same as Bootstrap mode.")
 		config.BootstrapExpect = 0
 		config.Bootstrap = true
 	} else if config.BootstrapExpect > 0 {
-		c.Ui.Error(fmt.Sprintf("WARNING: Expect Mode enabled, expecting %d servers", config.BootstrapExpect))
+		c.UI.Error(fmt.Sprintf("WARNING: Expect Mode enabled, expecting %d servers", config.BootstrapExpect))
 	}
 
 	// Warn if we are in bootstrap mode
 	if config.Bootstrap {
-		c.Ui.Error("WARNING: Bootstrap mode enabled! Do not enable unless necessary")
+		c.UI.Error("WARNING: Bootstrap mode enabled! Do not enable unless necessary")
 	}
 
 	// Need both tag key and value for EC2 discovery
 	if config.RetryJoinEC2.TagKey != "" || config.RetryJoinEC2.TagValue != "" {
 		if config.RetryJoinEC2.TagKey == "" || config.RetryJoinEC2.TagValue == "" {
-			c.Ui.Error("tag key and value are both required for EC2 retry-join")
+			c.UI.Error("tag key and value are both required for EC2 retry-join")
 			return nil
 		}
+	}
+
+	// EC2 and GCE discovery are mutually exclusive
+	if config.RetryJoinEC2.TagKey != "" && config.RetryJoinEC2.TagValue != "" && config.RetryJoinGCE.TagValue != "" {
+		c.UI.Error("EC2 and GCE discovery are mutually exclusive. Please provide one or the other.")
+		return nil
+	}
+
+	// Verify the node metadata entries are valid
+	if err := structs.ValidateMetadata(config.Meta); err != nil {
+		c.UI.Error(fmt.Sprintf("Failed to parse node metadata: %v", err))
+	}
+
+	// It doesn't make sense to include both UI options.
+	if config.EnableUI == true && config.UIDir != "" {
+		c.UI.Error("Both the ui and ui-dir flags were specified, please provide only one")
+		c.UI.Error("If trying to use your own web UI resources, use the ui-dir flag")
+		c.UI.Error("If using Consul version 0.7.0 or later, the web UI is included in the binary so use ui to enable it")
+		return nil
 	}
 
 	// Set the version info
@@ -358,164 +439,20 @@ func (c *Command) readConfig() *Config {
 	return config
 }
 
-// verifyUniqueListeners checks to see if an address was used more than once in
-// the config
-func (config *Config) verifyUniqueListeners() error {
-	listeners := []struct {
-		host  string
-		port  int
-		descr string
-	}{
-		{config.Addresses.RPC, config.Ports.RPC, "RPC"},
-		{config.Addresses.DNS, config.Ports.DNS, "DNS"},
-		{config.Addresses.HTTP, config.Ports.HTTP, "HTTP"},
-		{config.Addresses.HTTPS, config.Ports.HTTPS, "HTTPS"},
-		{config.AdvertiseAddr, config.Ports.Server, "Server RPC"},
-		{config.AdvertiseAddr, config.Ports.SerfLan, "Serf LAN"},
-		{config.AdvertiseAddr, config.Ports.SerfWan, "Serf WAN"},
-	}
-
-	type key struct {
-		host string
-		port int
-	}
-	m := make(map[key]string, len(listeners))
-
-	for _, l := range listeners {
-		if l.host == "" {
-			l.host = "0.0.0.0"
-		} else if strings.HasPrefix(l.host, "unix") {
-			// Don't compare ports on unix sockets
-			l.port = 0
-		}
-		if l.host == "0.0.0.0" && l.port <= 0 {
-			continue
-		}
-
-		k := key{l.host, l.port}
-		v, ok := m[k]
-		if ok {
-			return fmt.Errorf("%s address already configured for %s", l.descr, v)
-		}
-		m[k] = l.descr
-	}
-	return nil
-}
-
-// discoverEc2Hosts searches an AWS region, returning a list of instance ips
-// where EC2TagKey = EC2TagValue
-func (c *Config) discoverEc2Hosts(logger *log.Logger) ([]string, error) {
-	config := c.RetryJoinEC2
-
-	ec2meta := ec2metadata.New(session.New())
-	if config.Region == "" {
-		logger.Printf("[INFO] agent: No EC2 region provided, querying instance metadata endpoint...")
-		identity, err := ec2meta.GetInstanceIdentityDocument()
-		if err != nil {
-			return nil, err
-		}
-		config.Region = identity.Region
-	}
-
-	awsConfig := &aws.Config{
-		Region: &config.Region,
-		Credentials: credentials.NewChainCredentials(
-			[]credentials.Provider{
-				&credentials.StaticProvider{
-					Value: credentials.Value{
-						AccessKeyID:     config.AccessKeyID,
-						SecretAccessKey: config.SecretAccessKey,
-					},
-				},
-				&credentials.EnvProvider{},
-				&credentials.SharedCredentialsProvider{},
-				defaults.RemoteCredProvider(*(defaults.Config()), defaults.Handlers()),
-			}),
-	}
-
-	svc := ec2.New(session.New(), awsConfig)
-
-	resp, err := svc.DescribeInstances(&ec2.DescribeInstancesInput{
-		Filters: []*ec2.Filter{
-			{
-				Name: aws.String("tag:" + config.TagKey),
-				Values: []*string{
-					aws.String(config.TagValue),
-				},
-			},
-		},
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	var servers []string
-	for i := range resp.Reservations {
-		for _, instance := range resp.Reservations[i].Instances {
-			// Terminated instances don't have the PrivateIpAddress field
-			if instance.PrivateIpAddress != nil {
-				servers = append(servers, *instance.PrivateIpAddress)
-			}
-		}
-	}
-
-	return servers, nil
-}
-
 // setupAgent is used to start the agent and various interfaces
 func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *logger.LogWriter) error {
-	c.Ui.Output("Starting Consul agent...")
-	agent, err := Create(config, logOutput)
+	c.UI.Output("Starting Consul agent...")
+	agent, err := Create(config, logOutput, logWriter, c.configReloadCh)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error starting agent: %s", err))
+		c.UI.Error(fmt.Sprintf("Error starting agent: %s", err))
 		return err
 	}
 	c.agent = agent
 
-	// Setup the RPC listener
-	rpcAddr, err := config.ClientListener(config.Addresses.RPC, config.Ports.RPC)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Invalid RPC bind address: %s", err))
-		return err
-	}
-
-	// Clear the domain socket file if it exists
-	socketPath, isSocket := unixSocketAddr(config.Addresses.RPC)
-	if isSocket {
-		if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
-			agent.logger.Printf("[WARN] agent: Replacing socket %q", socketPath)
-		}
-		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-			c.Ui.Output(fmt.Sprintf("Error removing socket file: %s", err))
-			return err
-		}
-	}
-
-	rpcListener, err := net.Listen(rpcAddr.Network(), rpcAddr.String())
-	if err != nil {
-		agent.Shutdown()
-		c.Ui.Error(fmt.Sprintf("Error starting RPC listener: %s", err))
-		return err
-	}
-
-	// Set up ownership/permission bits on the socket file
-	if isSocket {
-		if err := setFilePermissions(socketPath, config.UnixSockets); err != nil {
-			agent.Shutdown()
-			c.Ui.Error(fmt.Sprintf("Error setting up socket: %s", err))
-			return err
-		}
-	}
-
-	// Start the IPC layer
-	c.Ui.Output("Starting Consul agent RPC...")
-	c.rpcServer = NewAgentRPC(agent, rpcListener, logOutput, logWriter)
-
 	// Enable the SCADA integration
 	if err := c.setupScadaConn(config); err != nil {
 		agent.Shutdown()
-		c.Ui.Error(fmt.Sprintf("Error starting SCADA connection: %s", err))
+		c.UI.Error(fmt.Sprintf("Error starting SCADA connection: %s", err))
 		return err
 	}
 
@@ -523,7 +460,7 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 		servers, err := NewHTTPServers(agent, config, logOutput)
 		if err != nil {
 			agent.Shutdown()
-			c.Ui.Error(fmt.Sprintf("Error starting http servers: %s", err))
+			c.UI.Error(fmt.Sprintf("Error starting http servers: %s", err))
 			return err
 		}
 		c.httpServers = servers
@@ -533,7 +470,7 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 		dnsAddr, err := config.ClientListener(config.Addresses.DNS, config.Ports.DNS)
 		if err != nil {
 			agent.Shutdown()
-			c.Ui.Error(fmt.Sprintf("Invalid DNS bind address: %s", err))
+			c.UI.Error(fmt.Sprintf("Invalid DNS bind address: %s", err))
 			return err
 		}
 
@@ -541,7 +478,7 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 			config.Domain, dnsAddr.String(), config.DNSRecursors)
 		if err != nil {
 			agent.Shutdown()
-			c.Ui.Error(fmt.Sprintf("Error starting dns server: %s", err))
+			c.UI.Error(fmt.Sprintf("Error starting dns server: %s", err))
 			return err
 		}
 		c.dnsServer = server
@@ -576,18 +513,18 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 // checkpointResults is used to handler periodic results from our update checker
 func (c *Command) checkpointResults(results *checkpoint.CheckResponse, err error) {
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to check for updates: %v", err))
+		c.UI.Error(fmt.Sprintf("Failed to check for updates: %v", err))
 		return
 	}
 	if results.Outdated {
-		c.Ui.Error(fmt.Sprintf("Newer Consul version available: %s (currently running: %s)", results.CurrentVersion, c.Version))
+		c.UI.Error(fmt.Sprintf("Newer Consul version available: %s (currently running: %s)", results.CurrentVersion, c.Version))
 	}
 	for _, alert := range results.Alerts {
 		switch alert.Level {
 		case "info":
-			c.Ui.Info(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
+			c.UI.Info(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
 		default:
-			c.Ui.Error(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
+			c.UI.Error(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
 		}
 	}
 }
@@ -598,13 +535,13 @@ func (c *Command) startupJoin(config *Config) error {
 		return nil
 	}
 
-	c.Ui.Output("Joining cluster...")
+	c.UI.Output("Joining cluster...")
 	n, err := c.agent.JoinLAN(config.StartJoin)
 	if err != nil {
 		return err
 	}
 
-	c.Ui.Info(fmt.Sprintf("Join completed. Synced with %d initial agents", n))
+	c.UI.Info(fmt.Sprintf("Join completed. Synced with %d initial agents", n))
 	return nil
 }
 
@@ -614,13 +551,13 @@ func (c *Command) startupJoinWan(config *Config) error {
 		return nil
 	}
 
-	c.Ui.Output("Joining -wan cluster...")
+	c.UI.Output("Joining -wan cluster...")
 	n, err := c.agent.JoinWAN(config.StartJoinWan)
 	if err != nil {
 		return err
 	}
 
-	c.Ui.Info(fmt.Sprintf("Join -wan completed. Synced with %d initial agents", n))
+	c.UI.Info(fmt.Sprintf("Join -wan completed. Synced with %d initial agents", n))
 	return nil
 }
 
@@ -629,7 +566,7 @@ func (c *Command) startupJoinWan(config *Config) error {
 func (c *Command) retryJoin(config *Config, errCh chan<- struct{}) {
 	ec2Enabled := config.RetryJoinEC2.TagKey != "" && config.RetryJoinEC2.TagValue != ""
 
-	if len(config.RetryJoin) == 0 && !ec2Enabled {
+	if len(config.RetryJoin) == 0 && !ec2Enabled && config.RetryJoinGCE.TagValue == "" {
 		return
 	}
 
@@ -640,12 +577,19 @@ func (c *Command) retryJoin(config *Config, errCh chan<- struct{}) {
 	for {
 		var servers []string
 		var err error
-		if ec2Enabled {
+		switch {
+		case ec2Enabled:
 			servers, err = config.discoverEc2Hosts(logger)
 			if err != nil {
-				logger.Printf("[ERROR] agent: Unable to query EC2 insances: %s", err)
+				logger.Printf("[ERROR] agent: Unable to query EC2 instances: %s", err)
 			}
-			logger.Printf("[INFO] agent: Discovered %d servers from EC2...", len(servers))
+			logger.Printf("[INFO] agent: Discovered %d servers from EC2", len(servers))
+		case config.RetryJoinGCE.TagValue != "":
+			servers, err = config.discoverGCEHosts(logger)
+			if err != nil {
+				logger.Printf("[ERROR] agent: Unable to query GCE insances: %s", err)
+			}
+			logger.Printf("[INFO] agent: Discovered %d servers from GCE", len(servers))
 		}
 
 		servers = append(servers, config.RetryJoin...)
@@ -720,11 +664,11 @@ func (c *Command) gossipEncrypted() bool {
 }
 
 func (c *Command) Run(args []string) int {
-	c.Ui = &cli.PrefixedUi{
+	c.UI = &cli.PrefixedUi{
 		OutputPrefix: "==> ",
 		InfoPrefix:   "    ",
 		ErrorPrefix:  "==> ",
-		Ui:           c.Ui,
+		Ui:           c.UI,
 	}
 
 	// Parse our configs
@@ -740,12 +684,15 @@ func (c *Command) Run(args []string) int {
 		EnableSyslog:   config.EnableSyslog,
 		SyslogFacility: config.SyslogFacility,
 	}
-	logFilter, logGate, logWriter, logOutput, ok := logger.Setup(logConfig, c.Ui)
+	logFilter, logGate, logWriter, logOutput, ok := logger.Setup(logConfig, c.UI)
 	if !ok {
 		return 1
 	}
 	c.logFilter = logFilter
 	c.logOutput = logOutput
+
+	// Setup the channel for triggering config reloads
+	c.configReloadCh = make(chan chan error)
 
 	/* Setup telemetry
 	Aggregate on 10 second intervals for 1 minute. Expose the
@@ -761,7 +708,7 @@ func (c *Command) Run(args []string) int {
 	if config.Telemetry.StatsiteAddr != "" {
 		sink, err := metrics.NewStatsiteSink(config.Telemetry.StatsiteAddr)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to start statsite sink. Got: %s", err))
+			c.UI.Error(fmt.Sprintf("Failed to start statsite sink. Got: %s", err))
 			return 1
 		}
 		fanout = append(fanout, sink)
@@ -771,7 +718,7 @@ func (c *Command) Run(args []string) int {
 	if config.Telemetry.StatsdAddr != "" {
 		sink, err := metrics.NewStatsdSink(config.Telemetry.StatsdAddr)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to start statsd sink. Got: %s", err))
+			c.UI.Error(fmt.Sprintf("Failed to start statsd sink. Got: %s", err))
 			return 1
 		}
 		fanout = append(fanout, sink)
@@ -787,7 +734,7 @@ func (c *Command) Run(args []string) int {
 
 		sink, err := datadog.NewDogStatsdSink(config.Telemetry.DogStatsdAddr, metricsConf.HostName)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to start DogStatsd sink. Got: %s", err))
+			c.UI.Error(fmt.Sprintf("Failed to start DogStatsd sink. Got: %s", err))
 			return 1
 		}
 		sink.SetTags(tags)
@@ -805,15 +752,17 @@ func (c *Command) Run(args []string) int {
 		cfg.CheckManager.Check.ForceMetricActivation = config.Telemetry.CirconusCheckForceMetricActivation
 		cfg.CheckManager.Check.InstanceID = config.Telemetry.CirconusCheckInstanceID
 		cfg.CheckManager.Check.SearchTag = config.Telemetry.CirconusCheckSearchTag
+		cfg.CheckManager.Check.DisplayName = config.Telemetry.CirconusCheckDisplayName
+		cfg.CheckManager.Check.Tags = config.Telemetry.CirconusCheckTags
 		cfg.CheckManager.Broker.ID = config.Telemetry.CirconusBrokerID
 		cfg.CheckManager.Broker.SelectTag = config.Telemetry.CirconusBrokerSelectTag
 
-		if cfg.CheckManager.API.TokenApp == "" {
-			cfg.CheckManager.API.TokenApp = "consul"
+		if cfg.CheckManager.Check.DisplayName == "" {
+			cfg.CheckManager.Check.DisplayName = "Consul"
 		}
 
-		if cfg.CheckManager.Check.InstanceID == "" {
-			cfg.CheckManager.Check.InstanceID = fmt.Sprintf("%s:%s", config.NodeName, config.Datacenter)
+		if cfg.CheckManager.API.TokenApp == "" {
+			cfg.CheckManager.API.TokenApp = "consul"
 		}
 
 		if cfg.CheckManager.Check.SearchTag == "" {
@@ -822,7 +771,7 @@ func (c *Command) Run(args []string) int {
 
 		sink, err := circonus.NewCirconusSink(cfg)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to start Circonus sink. Got: %s", err))
+			c.UI.Error(fmt.Sprintf("Failed to start Circonus sink. Got: %s", err))
 			return 1
 		}
 		sink.Start()
@@ -843,9 +792,6 @@ func (c *Command) Run(args []string) int {
 		return 1
 	}
 	defer c.agent.Shutdown()
-	if c.rpcServer != nil {
-		defer c.rpcServer.Shutdown()
-	}
 	if c.dnsServer != nil {
 		defer c.dnsServer.Shutdown()
 	}
@@ -855,8 +801,8 @@ func (c *Command) Run(args []string) int {
 
 	// Check and shut down the SCADA listeners at the end
 	defer func() {
-		if c.scadaHttp != nil {
-			c.scadaHttp.Shutdown()
+		if c.scadaHTTP != nil {
+			c.scadaHTTP.Shutdown()
 		}
 		if c.scadaProvider != nil {
 			c.scadaProvider.Shutdown()
@@ -865,29 +811,43 @@ func (c *Command) Run(args []string) int {
 
 	// Join startup nodes if specified
 	if err := c.startupJoin(config); err != nil {
-		c.Ui.Error(err.Error())
+		c.UI.Error(err.Error())
 		return 1
 	}
 
 	// Join startup nodes if specified
 	if err := c.startupJoinWan(config); err != nil {
-		c.Ui.Error(err.Error())
+		c.UI.Error(err.Error())
 		return 1
 	}
 
 	// Get the new client http listener addr
-	httpAddr, err := config.ClientListener(config.Addresses.HTTP, config.Ports.HTTP)
+	var httpAddr net.Addr
+	var err error
+	if config.Ports.HTTP != -1 {
+		httpAddr, err = config.ClientListener(config.Addresses.HTTP, config.Ports.HTTP)
+	} else if config.Ports.HTTPS != -1 {
+		httpAddr, err = config.ClientListener(config.Addresses.HTTPS, config.Ports.HTTPS)
+	} else if len(config.WatchPlans) > 0 {
+		c.UI.Error("Error: cannot use watches if both HTTP and HTTPS are disabled")
+		return 1
+	}
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to determine HTTP address: %v", err))
+		c.UI.Error(fmt.Sprintf("Failed to determine HTTP address: %v", err))
 	}
 
 	// Register the watches
 	for _, wp := range config.WatchPlans {
-		go func(wp *watch.WatchPlan) {
+		go func(wp *watch.Plan) {
 			wp.Handler = makeWatchHandler(logOutput, wp.Exempt["handler"])
 			wp.LogOutput = c.logOutput
-			if err := wp.Run(httpAddr.String()); err != nil {
-				c.Ui.Error(fmt.Sprintf("Error running watch: %v", err))
+			addr := httpAddr.String()
+			// If it's a unix socket, prefix with unix:// so the client initializes correctly
+			if httpAddr.Network() == "unix" {
+				addr = "unix://" + addr
+			}
+			if err := wp.Run(addr); err != nil {
+				c.UI.Error(fmt.Sprintf("Error running watch: %v", err))
 			}
 		}(wp)
 	}
@@ -909,22 +869,23 @@ func (c *Command) Run(args []string) int {
 	// Let the agent know we've finished registration
 	c.agent.StartSync()
 
-	c.Ui.Output("Consul agent running!")
-	c.Ui.Info(fmt.Sprintf("       Version: '%s'", c.HumanVersion))
-	c.Ui.Info(fmt.Sprintf("     Node name: '%s'", config.NodeName))
-	c.Ui.Info(fmt.Sprintf("    Datacenter: '%s'", config.Datacenter))
-	c.Ui.Info(fmt.Sprintf("        Server: %v (bootstrap: %v)", config.Server, config.Bootstrap))
-	c.Ui.Info(fmt.Sprintf("   Client Addr: %v (HTTP: %d, HTTPS: %d, DNS: %d, RPC: %d)", config.ClientAddr,
-		config.Ports.HTTP, config.Ports.HTTPS, config.Ports.DNS, config.Ports.RPC))
-	c.Ui.Info(fmt.Sprintf("  Cluster Addr: %v (LAN: %d, WAN: %d)", config.AdvertiseAddr,
+	c.UI.Output("Consul agent running!")
+	c.UI.Info(fmt.Sprintf("       Version: '%s'", c.HumanVersion))
+	c.UI.Info(fmt.Sprintf("       Node ID: '%s'", config.NodeID))
+	c.UI.Info(fmt.Sprintf("     Node name: '%s'", config.NodeName))
+	c.UI.Info(fmt.Sprintf("    Datacenter: '%s'", config.Datacenter))
+	c.UI.Info(fmt.Sprintf("        Server: %v (bootstrap: %v)", config.Server, config.Bootstrap))
+	c.UI.Info(fmt.Sprintf("   Client Addr: %v (HTTP: %d, HTTPS: %d, DNS: %d)", config.ClientAddr,
+		config.Ports.HTTP, config.Ports.HTTPS, config.Ports.DNS))
+	c.UI.Info(fmt.Sprintf("  Cluster Addr: %v (LAN: %d, WAN: %d)", config.AdvertiseAddr,
 		config.Ports.SerfLan, config.Ports.SerfWan))
-	c.Ui.Info(fmt.Sprintf("Gossip encrypt: %v, RPC-TLS: %v, TLS-Incoming: %v",
+	c.UI.Info(fmt.Sprintf("Gossip encrypt: %v, RPC-TLS: %v, TLS-Incoming: %v",
 		gossipEncrypted, config.VerifyOutgoing, config.VerifyIncoming))
-	c.Ui.Info(fmt.Sprintf("         Atlas: %s", atlas))
+	c.UI.Info(fmt.Sprintf("         Atlas: %s", atlas))
 
 	// Enable log streaming
-	c.Ui.Info("")
-	c.Ui.Output("Log data will now stream in as it occurs:\n")
+	c.UI.Info("")
+	c.UI.Output("Log data will now stream in as it occurs:\n")
 	logGate.Flush()
 
 	// Start retry join process
@@ -943,15 +904,18 @@ func (c *Command) Run(args []string) int {
 func (c *Command) handleSignals(config *Config, retryJoin <-chan struct{}, retryJoinWan <-chan struct{}) int {
 	signalCh := make(chan os.Signal, 4)
 	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE)
 
 	// Wait for a signal
 WAIT:
 	var sig os.Signal
+	var reloadErrCh chan error
 	select {
 	case s := <-signalCh:
 		sig = s
-	case <-c.rpcServer.ReloadCh():
+	case ch := <-c.configReloadCh:
 		sig = syscall.SIGHUP
+		reloadErrCh = ch
 	case <-c.ShutdownCh:
 		sig = os.Interrupt
 	case <-retryJoin:
@@ -962,12 +926,26 @@ WAIT:
 		// Agent is already shutdown!
 		return 0
 	}
-	c.Ui.Output(fmt.Sprintf("Caught signal: %v", sig))
+
+	// Skip SIGPIPE signals and skip logging whenever such signal is received as well
+	if sig == syscall.SIGPIPE {
+		goto WAIT
+	}
+
+	c.UI.Output(fmt.Sprintf("Caught signal: %v", sig))
 
 	// Check if this is a SIGHUP
 	if sig == syscall.SIGHUP {
-		if conf := c.handleReload(config); conf != nil {
+		conf, err := c.handleReload(config)
+		if conf != nil {
 			config = conf
+		}
+		if err != nil {
+			c.UI.Error(err.Error())
+		}
+		// Send result back if reload was called via HTTP
+		if reloadErrCh != nil {
+			reloadErrCh <- err
 		}
 		goto WAIT
 	}
@@ -987,10 +965,10 @@ WAIT:
 
 	// Attempt a graceful leave
 	gracefulCh := make(chan struct{})
-	c.Ui.Output("Gracefully shutting down agent...")
+	c.UI.Output("Gracefully shutting down agent...")
 	go func() {
 		if err := c.agent.Leave(); err != nil {
-			c.Ui.Error(fmt.Sprintf("Error: %s", err))
+			c.UI.Error(fmt.Sprintf("Error: %s", err))
 			return
 		}
 		close(gracefulCh)
@@ -1008,12 +986,13 @@ WAIT:
 }
 
 // handleReload is invoked when we should reload our configs, e.g. SIGHUP
-func (c *Command) handleReload(config *Config) *Config {
-	c.Ui.Output("Reloading configuration...")
+func (c *Command) handleReload(config *Config) (*Config, error) {
+	c.UI.Output("Reloading configuration...")
+	var errs error
 	newConf := c.readConfig()
 	if newConf == nil {
-		c.Ui.Error(fmt.Sprintf("Failed to reload configs"))
-		return config
+		errs = multierror.Append(errs, fmt.Errorf("Failed to reload configs"))
+		return config, errs
 	}
 
 	// Change the log level
@@ -1021,7 +1000,7 @@ func (c *Command) handleReload(config *Config) *Config {
 	if logger.ValidateLevelFilter(minLevel, c.logFilter) {
 		c.logFilter.SetMinLevel(minLevel)
 	} else {
-		c.Ui.Error(fmt.Sprintf(
+		errs = multierror.Append(fmt.Errorf(
 			"Invalid log level: %s. Valid log levels are: %v",
 			minLevel, c.logFilter.Levels))
 
@@ -1037,31 +1016,36 @@ func (c *Command) handleReload(config *Config) *Config {
 	snap := c.agent.snapshotCheckState()
 	defer c.agent.restoreCheckState(snap)
 
-	// First unload all checks and services. This lets us begin the reload
+	// First unload all checks, services, and metadata. This lets us begin the reload
 	// with a clean slate.
 	if err := c.agent.unloadServices(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed unloading services: %s", err))
-		return nil
+		errs = multierror.Append(errs, fmt.Errorf("Failed unloading services: %s", err))
+		return nil, errs
 	}
 	if err := c.agent.unloadChecks(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed unloading checks: %s", err))
-		return nil
+		errs = multierror.Append(errs, fmt.Errorf("Failed unloading checks: %s", err))
+		return nil, errs
 	}
+	c.agent.unloadMetadata()
 
-	// Reload services and check definitions.
+	// Reload service/check definitions and metadata.
 	if err := c.agent.loadServices(newConf); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed reloading services: %s", err))
-		return nil
+		errs = multierror.Append(errs, fmt.Errorf("Failed reloading services: %s", err))
+		return nil, errs
 	}
 	if err := c.agent.loadChecks(newConf); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed reloading checks: %s", err))
-		return nil
+		errs = multierror.Append(errs, fmt.Errorf("Failed reloading checks: %s", err))
+		return nil, errs
+	}
+	if err := c.agent.loadMetadata(newConf); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed reloading metadata: %s", err))
+		return nil, errs
 	}
 
 	// Get the new client listener addr
 	httpAddr, err := newConf.ClientListener(config.Addresses.HTTP, config.Ports.HTTP)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to determine HTTP address: %v", err))
+		errs = multierror.Append(errs, fmt.Errorf("Failed to determine HTTP address: %v", err))
 	}
 
 	// Deregister the old watches
@@ -1071,11 +1055,11 @@ func (c *Command) handleReload(config *Config) *Config {
 
 	// Register the new watches
 	for _, wp := range newConf.WatchPlans {
-		go func(wp *watch.WatchPlan) {
+		go func(wp *watch.Plan) {
 			wp.Handler = makeWatchHandler(c.logOutput, wp.Exempt["handler"])
 			wp.LogOutput = c.logOutput
 			if err := wp.Run(httpAddr.String()); err != nil {
-				c.Ui.Error(fmt.Sprintf("Error running watch: %v", err))
+				errs = multierror.Append(errs, fmt.Errorf("Error running watch: %v", err))
 			}
 		}(wp)
 	}
@@ -1085,12 +1069,12 @@ func (c *Command) handleReload(config *Config) *Config {
 		newConf.AtlasToken != config.AtlasToken ||
 		newConf.AtlasEndpoint != config.AtlasEndpoint {
 		if err := c.setupScadaConn(newConf); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed reloading SCADA client: %s", err))
-			return nil
+			errs = multierror.Append(errs, fmt.Errorf("Failed reloading SCADA client: %s", err))
+			return nil, errs
 		}
 	}
 
-	return newConf
+	return newConf, errs
 }
 
 // startScadaClient is used to start a new SCADA provider and listener,
@@ -1100,14 +1084,18 @@ func (c *Command) setupScadaConn(config *Config) error {
 	if c.scadaProvider != nil {
 		c.scadaProvider.Shutdown()
 	}
-	if c.scadaHttp != nil {
-		c.scadaHttp.Shutdown()
+	if c.scadaHTTP != nil {
+		c.scadaHTTP.Shutdown()
 	}
 
 	// No-op if we don't have an infrastructure
 	if config.AtlasInfrastructure == "" {
 		return nil
 	}
+
+	c.UI.Error("WARNING: The hosted version of Consul Enterprise will be deprecated " +
+		"on March 7th, 2017. For details, see " +
+		"https://atlas.hashicorp.com/help/consul/alternatives")
 
 	scadaConfig := &scada.Config{
 		Service:      "consul",
@@ -1126,13 +1114,13 @@ func (c *Command) setupScadaConn(config *Config) error {
 	}
 
 	// Create the new provider and listener
-	c.Ui.Output("Connecting to Atlas: " + config.AtlasInfrastructure)
+	c.UI.Output("Connecting to Atlas: " + config.AtlasInfrastructure)
 	provider, list, err := scada.NewHTTPProvider(scadaConfig, c.logOutput)
 	if err != nil {
 		return err
 	}
 	c.scadaProvider = provider
-	c.scadaHttp = newScadaHttp(c.agent, list)
+	c.scadaHTTP = newScadaHTTP(c.agent, list)
 	return nil
 }
 
@@ -1147,60 +1135,7 @@ Usage: consul agent [options]
   Starts the Consul agent and runs until an interrupt is received. The
   agent represents a single node in a cluster.
 
-Options:
+ ` + c.Command.Help()
 
-  -advertise=addr           Sets the advertise address to use
-  -advertise-wan=addr       Sets address to advertise on wan instead of advertise addr
-  -atlas=org/name           Sets the Atlas infrastructure name, enables SCADA.
-  -atlas-join               Enables auto-joining the Atlas cluster
-  -atlas-token=token        Provides the Atlas API token
-  -atlas-endpoint=1.2.3.4   The address of the endpoint for Atlas integration.
-  -bootstrap                Sets server to bootstrap mode
-  -bind=0.0.0.0             Sets the bind address for cluster communication
-  -http-port=8500           Sets the HTTP API port to listen on
-  -bootstrap-expect=0       Sets server to expect bootstrap mode.
-  -client=127.0.0.1         Sets the address to bind for client access.
-                            This includes RPC, DNS, HTTP and HTTPS (if configured)
-  -config-file=foo          Path to a JSON file to read configuration from.
-                            This can be specified multiple times.
-  -config-dir=foo           Path to a directory to read configuration files
-                            from. This will read every file ending in ".json"
-                            as configuration in this directory in alphabetical
-                            order. This can be specified multiple times.
-  -data-dir=path            Path to a data directory to store agent state
-  -dev                      Starts the agent in development mode.
-  -recursor=1.2.3.4         Address of an upstream DNS server.
-                            Can be specified multiple times.
-  -dc=east-aws              Datacenter of the agent (deprecated: use 'datacenter' instead).
-  -datacenter=east-aws      Datacenter of the agent.
-  -encrypt=key              Provides the gossip encryption key
-  -join=1.2.3.4             Address of an agent to join at start time.
-                            Can be specified multiple times.
-  -join-wan=1.2.3.4         Address of an agent to join -wan at start time.
-                            Can be specified multiple times.
-  -retry-join=1.2.3.4       Address of an agent to join at start time with
-                            retries enabled. Can be specified multiple times.
-  -retry-interval=30s       Time to wait between join attempts.
-  -retry-max=0              Maximum number of join attempts. Defaults to 0, which
-                            will retry indefinitely.
-  -retry-join-ec2-region    EC2 Region to use for discovering servers to join.
-  -retry-join-ec2-tag-key   EC2 tag key to filter on for server discovery
-  -retry-join-ec2-tag-value EC2 tag value to filter on for server discovery
-  -retry-join-wan=1.2.3.4   Address of an agent to join -wan at start time with
-                            retries enabled. Can be specified multiple times.
-  -retry-interval-wan=30s   Time to wait between join -wan attempts.
-  -retry-max-wan=0          Maximum number of join -wan attempts. Defaults to 0, which
-                            will retry indefinitely.
-  -log-level=info           Log level of the agent.
-  -node=hostname            Name of this node. Must be unique in the cluster
-  -protocol=N               Sets the protocol version. Defaults to latest.
-  -rejoin                   Ignores a previous leave and attempts to rejoin the cluster.
-  -server                   Switches agent to server mode.
-  -syslog                   Enables logging to syslog
-  -ui                       Enables the built-in static web UI server
-  -ui-dir=path              Path to directory containing the Web UI resources
-  -pid-file=path            Path to file to store agent PID
-
- `
 	return strings.TrimSpace(helpText)
 }

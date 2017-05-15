@@ -14,6 +14,8 @@ import (
 
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/tlsutil"
+	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/consul/watch"
 	"github.com/mitchellh/mapstructure"
 )
@@ -25,10 +27,13 @@ type PortConfig struct {
 	DNS     int // DNS Query interface
 	HTTP    int // HTTP API
 	HTTPS   int // HTTPS API
-	RPC     int // CLI RPC
 	SerfLan int `mapstructure:"serf_lan"` // LAN gossip (Client + Server)
 	SerfWan int `mapstructure:"serf_wan"` // WAN gossip (Server only)
 	Server  int // Server internal RPC
+
+	// RPC is deprecated and is no longer used. It will be removed in a future
+	// version.
+	RPC int // CLI RPC
 }
 
 // AddressConfig is used to provide address overrides
@@ -38,7 +43,10 @@ type AddressConfig struct {
 	DNS   string // DNS Query interface
 	HTTP  string // HTTP API
 	HTTPS string // HTTPS API
-	RPC   string // CLI RPC
+
+	// RPC is deprecated and is no longer used. It will be removed in a future
+	// version.
+	RPC string // CLI RPC
 }
 
 type AdvertiseAddrsConfig struct {
@@ -128,8 +136,33 @@ type RetryJoinEC2 struct {
 	TagValue string `mapstructure:"tag_value"`
 
 	// The AWS credentials to use for making requests to EC2
-	AccessKeyID     string `mapstructure:"access_key_id"`
-	SecretAccessKey string `mapstructure:"secret_access_key"`
+	AccessKeyID     string `mapstructure:"access_key_id" json:"-"`
+	SecretAccessKey string `mapstructure:"secret_access_key" json:"-"`
+}
+
+// RetryJoinGCE is used to configure discovery of instances via Google Compute
+// Engine's API.
+type RetryJoinGCE struct {
+	// The name of the project the instances reside in.
+	ProjectName string `mapstructure:"project_name"`
+
+	// A regular expression (RE2) pattern for the zones you want to discover the instances in.
+	// Example: us-west1-.*, or us-(?west|east).*.
+	ZonePattern string `mapstructure:"zone_pattern"`
+
+	// The tag value to search for when filtering instances.
+	TagValue string `mapstructure:"tag_value"`
+
+	// A path to a JSON file with the service account credentials necessary to
+	// connect to GCE. If this is not defined, the following chain is respected:
+	// 1. A JSON file whose path is specified by the
+	//		GOOGLE_APPLICATION_CREDENTIALS environment variable.
+	// 2. A JSON file in a location known to the gcloud command-line tool.
+	//    On Windows, this is %APPDATA%/gcloud/application_default_credentials.json.
+	//  	On other systems, $HOME/.config/gcloud/application_default_credentials.json.
+	// 3. On Google Compute Engine, it fetches credentials from the metadata
+	//    server.  (In this final case any provided scopes are ignored.)
+	CredentialsFile string `mapstructure:"credentials_file"`
 }
 
 // Performance is used to tune the performance of Consul's subsystems.
@@ -213,6 +246,13 @@ type Telemetry struct {
 	// narrow down the search results when neither a Submission URL or Check ID is provided.
 	// Default: service:app (e.g. service:consul)
 	CirconusCheckSearchTag string `mapstructure:"circonus_check_search_tag"`
+	// CirconusCheckTags is a comma separated list of tags to apply to the check. Note that
+	// the value of CirconusCheckSearchTag will always be added to the check.
+	// Default: none
+	CirconusCheckTags string `mapstructure:"circonus_check_tags"`
+	// CirconusCheckDisplayName is the name for the check which will be displayed in the Circonus UI.
+	// Default: value of CirconusCheckInstanceID
+	CirconusCheckDisplayName string `mapstructure:"circonus_check_display_name"`
 	// CirconusBrokerID is an explicit broker to use when creating a new check. The numeric portion
 	// of broker._cid. If metric management is enabled and neither a Submission URL nor Check ID
 	// is provided, an attempt will be made to search for an existing check using Instance ID and
@@ -227,6 +267,37 @@ type Telemetry struct {
 	// (e.g. a specific geo location or datacenter, dc:sfo)
 	// Default: none
 	CirconusBrokerSelectTag string `mapstructure:"circonus_broker_select_tag"`
+}
+
+// Autopilot is used to configure helpful features for operating Consul servers.
+type Autopilot struct {
+	// CleanupDeadServers enables the automatic cleanup of dead servers when new ones
+	// are added to the peer list. Defaults to true.
+	CleanupDeadServers *bool `mapstructure:"cleanup_dead_servers"`
+
+	// LastContactThreshold is the limit on the amount of time a server can go
+	// without leader contact before being considered unhealthy.
+	LastContactThreshold    *time.Duration `mapstructure:"-" json:"-"`
+	LastContactThresholdRaw string         `mapstructure:"last_contact_threshold"`
+
+	// MaxTrailingLogs is the amount of entries in the Raft Log that a server can
+	// be behind before being considered unhealthy.
+	MaxTrailingLogs *uint64 `mapstructure:"max_trailing_logs"`
+
+	// ServerStabilizationTime is the minimum amount of time a server must be
+	// in a stable, healthy state before it can be added to the cluster. Only
+	// applicable with Raft protocol version 3 or higher.
+	ServerStabilizationTime    *time.Duration `mapstructure:"-" json:"-"`
+	ServerStabilizationTimeRaw string         `mapstructure:"server_stabilization_time"`
+
+	// (Enterprise-only) RedundancyZoneTag is the Meta tag to use for separating servers
+	// into zones for redundancy. If left blank, this feature will be disabled.
+	RedundancyZoneTag string `mapstructure:"redundancy_zone_tag"`
+
+	// (Enterprise-only) DisableUpgradeMigration will disable Autopilot's upgrade migration
+	// strategy of waiting until enough newer-versioned servers have been added to the
+	// cluster before promoting them to voters.
+	DisableUpgradeMigration *bool `mapstructure:"disable_upgrade_migration"`
 }
 
 // Config is the configuration that can be set for an Agent.
@@ -252,6 +323,10 @@ type Config struct {
 	// or merely as a client. Servers have more state, take part
 	// in leader election, etc.
 	Server bool `mapstructure:"server"`
+
+	// (Enterprise-only) NonVotingServer is whether this server will act as a non-voting member
+	// of the cluster to help provide read scalability.
+	NonVotingServer bool `mapstructure:"non_voting_server"`
 
 	// Datacenter is the datacenter this node is in. Defaults to dc1
 	Datacenter string `mapstructure:"datacenter"`
@@ -279,6 +354,15 @@ type Config struct {
 
 	// LogLevel is the level of the logs to putout
 	LogLevel string `mapstructure:"log_level"`
+
+	// Node ID is a unique ID for this node across space and time. Defaults
+	// to a randomly-generated ID that persists in the data-dir.
+	NodeID types.NodeID `mapstructure:"node_id"`
+
+	// DisableHostNodeID will prevent Consul from using information from the
+	// host to generate a node ID, and will cause Consul to generate a
+	// random ID instead.
+	DisableHostNodeID bool `mapstructure:"disable_host_node_id"`
 
 	// Node name is the name we use to advertise. Defaults to hostname.
 	NodeName string `mapstructure:"node_name"`
@@ -335,6 +419,11 @@ type Config struct {
 	// they are configured with TranslateWanAddrs set to true.
 	TaggedAddresses map[string]string
 
+	// Node metadata key/value pairs. These are excluded from JSON output
+	// because they can be reloaded and might be stale when shown from the
+	// config instead of the local state.
+	Meta map[string]string `mapstructure:"node_meta" json:"-"`
+
 	// LeaveOnTerm controls if Serf does a graceful leave when receiving
 	// the TERM signal. Defaults true on clients, false on servers. This can
 	// be changed on reload.
@@ -345,10 +434,16 @@ type Config struct {
 	// servers. This can be changed on reload.
 	SkipLeaveOnInt *bool `mapstructure:"skip_leave_on_interrupt"`
 
+	// Autopilot is used to configure helpful features for operating Consul servers.
+	Autopilot Autopilot `mapstructure:"autopilot"`
+
 	Telemetry Telemetry `mapstructure:"telemetry"`
 
 	// Protocol is the Consul protocol version to use.
 	Protocol int `mapstructure:"protocol"`
+
+	// RaftProtocol sets the Raft protocol version to use on this server.
+	RaftProtocol int `mapstructure:"raft_protocol"`
 
 	// EnableDebug is used to enable various debugging features
 	EnableDebug bool `mapstructure:"enable_debug"`
@@ -357,6 +452,16 @@ type Config struct {
 	// This means that TCP requests are forbidden, only allowing for TLS. TLS connections
 	// must match a provided certificate authority. This can be used to force client auth.
 	VerifyIncoming bool `mapstructure:"verify_incoming"`
+
+	// VerifyIncomingRPC is used to verify the authenticity of incoming RPC connections.
+	// This means that TCP requests are forbidden, only allowing for TLS. TLS connections
+	// must match a provided certificate authority. This can be used to force client auth.
+	VerifyIncomingRPC bool `mapstructure:"verify_incoming_rpc"`
+
+	// VerifyIncomingHTTPS is used to verify the authenticity of incoming HTTPS connections.
+	// This means that TCP requests are forbidden, only allowing for TLS. TLS connections
+	// must match a provided certificate authority. This can be used to force client auth.
+	VerifyIncomingHTTPS bool `mapstructure:"verify_incoming_https"`
 
 	// VerifyOutgoing is used to verify the authenticity of outgoing connections.
 	// This means that TLS requests are used. TLS connections must match a provided
@@ -375,6 +480,10 @@ type Config struct {
 	// or VerifyOutgoing to verify the TLS connection.
 	CAFile string `mapstructure:"ca_file"`
 
+	// CAPath is a path to a directory of certificate authority files. This is used with
+	// VerifyIncoming or VerifyOutgoing to verify the TLS connection.
+	CAPath string `mapstructure:"ca_path"`
+
 	// CertFile is used to provide a TLS certificate that is used for serving TLS connections.
 	// Must be provided to serve TLS connections.
 	CertFile string `mapstructure:"cert_file"`
@@ -386,6 +495,17 @@ type Config struct {
 	// ServerName is used with the TLS certificates to ensure the name we
 	// provide matches the certificate
 	ServerName string `mapstructure:"server_name"`
+
+	// TLSMinVersion is used to set the minimum TLS version used for TLS connections.
+	TLSMinVersion string `mapstructure:"tls_min_version"`
+
+	// TLSCipherSuites is used to specify the list of supported ciphersuites.
+	TLSCipherSuites    []uint16 `mapstructure:"-" json:"-"`
+	TLSCipherSuitesRaw string   `mapstructure:"tls_cipher_suites"`
+
+	// TLSPreferServerCipherSuites specifies whether to prefer the server's ciphersuite
+	// over the client ciphersuites.
+	TLSPreferServerCipherSuites bool `mapstructure:"tls_prefer_server_cipher_suites"`
 
 	// StartJoin is a list of addresses to attempt to join when the
 	// agent starts. If Serf is unable to communicate with any of these
@@ -414,6 +534,9 @@ type Config struct {
 	// RetryJoinEC2 configuration
 	RetryJoinEC2 RetryJoinEC2 `mapstructure:"retry_join_ec2"`
 
+	// The config struct for the GCE tag server discovery feature.
+	RetryJoinGCE RetryJoinGCE `mapstructure:"retry_join_gce"`
+
 	// RetryJoinWan is a list of addresses to join -wan with retry enabled.
 	RetryJoinWan []string `mapstructure:"retry_join_wan"`
 
@@ -436,13 +559,13 @@ type Config struct {
 	ReconnectTimeoutWan    time.Duration `mapstructure:"-"`
 	ReconnectTimeoutWanRaw string        `mapstructure:"reconnect_timeout_wan"`
 
-	// EnableUi enables the statically-compiled assets for the Consul web UI and
+	// EnableUI enables the statically-compiled assets for the Consul web UI and
 	// serves them at the default /ui/ endpoint automatically.
-	EnableUi bool `mapstructure:"ui"`
+	EnableUI bool `mapstructure:"ui"`
 
-	// UiDir is the directory containing the Web UI resources.
+	// UIDir is the directory containing the Web UI resources.
 	// If provided, the UI endpoints will be enabled.
-	UiDir string `mapstructure:"ui_dir"`
+	UIDir string `mapstructure:"ui_dir"`
 
 	// PidFile is the file to store our PID in
 	PidFile string `mapstructure:"pid_file"`
@@ -481,6 +604,16 @@ type Config struct {
 	// token is not provided. If not configured the 'anonymous' token is used.
 	ACLToken string `mapstructure:"acl_token" json:"-"`
 
+	// ACLAgentMasterToken is a special token that has full read and write
+	// privileges for this agent, and can be used to call agent endpoints
+	// when no servers are available.
+	ACLAgentMasterToken string `mapstructure:"acl_agent_master_token" json:"-"`
+
+	// ACLAgentToken is the default token used to make requests for the agent
+	// itself, such as for registering itself with the catalog. If not
+	// configured, the 'acl_token' will be used.
+	ACLAgentToken string `mapstructure:"acl_agent_token" json:"-"`
+
 	// ACLMasterToken is used to bootstrap the ACL system. It should be specified
 	// on the servers in the ACLDatacenter. When the leader comes online, it ensures
 	// that the Master token is available. This provides the initial token.
@@ -502,9 +635,15 @@ type Config struct {
 	// white-lists.
 	ACLDefaultPolicy string `mapstructure:"acl_default_policy"`
 
+	// ACLDisabledTTL is used by clients to determine how long they will
+	// wait to check again with the servers if they discover ACLs are not
+	// enabled.
+	ACLDisabledTTL time.Duration `mapstructure:"-"`
+
 	// ACLDownPolicy is used to control the ACL interaction when we cannot
 	// reach the ACLDatacenter and the token is not in the cache.
 	// There are two modes:
+	//   * allow - Allow all requests
 	//   * deny - Deny all requests
 	//   * extend-cache - Ignore the cache expiration, and allow cached
 	//                    ACL's to be used to service requests. This
@@ -518,6 +657,10 @@ type Config struct {
 	// other than the ACLDatacenter.
 	ACLReplicationToken string `mapstructure:"acl_replication_token" json:"-"`
 
+	// ACLEnforceVersion8 is used to gate a set of ACL policy features that
+	// are opt-in prior to Consul 0.8 and opt-out in Consul 0.8 and later.
+	ACLEnforceVersion8 *bool `mapstructure:"acl_enforce_version_8"`
+
 	// Watches are used to monitor various endpoints and to invoke a
 	// handler to act appropriately. These are managed entirely in the
 	// agent layer using the standard APIs.
@@ -525,7 +668,7 @@ type Config struct {
 
 	// DisableRemoteExec is used to turn off the remote execution
 	// feature. This is for security to prevent unknown scripts from running.
-	DisableRemoteExec bool `mapstructure:"disable_remote_exec"`
+	DisableRemoteExec *bool `mapstructure:"disable_remote_exec"`
 
 	// DisableUpdateCheck is used to turn off the automatic update and
 	// security bulletin checking.
@@ -598,7 +741,7 @@ type Config struct {
 	VersionPrerelease string `mapstructure:"-"`
 
 	// WatchPlans contains the compiled watches
-	WatchPlans []*watch.WatchPlan `mapstructure:"-" json:"-"`
+	WatchPlans []*watch.Plan `mapstructure:"-" json:"-"`
 
 	// UnixSockets is a map of socket configuration data
 	UnixSockets UnixSocketConfig `mapstructure:"unix_sockets"`
@@ -611,6 +754,16 @@ type Config struct {
 // Bool is used to initialize bool pointers in struct literals.
 func Bool(b bool) *bool {
 	return &b
+}
+
+// Uint64 is used to initialize uint64 pointers in struct literals.
+func Uint64(i uint64) *uint64 {
+	return &i
+}
+
+// Duration is used to initialize time.Duration pointers in struct literals.
+func Duration(d time.Duration) *time.Duration {
+	return &d
 }
 
 // UnixSocketPermissions contains information about a unix socket, and
@@ -669,7 +822,6 @@ func DefaultConfig() *Config {
 			DNS:     8600,
 			HTTP:    8500,
 			HTTPS:   -1,
-			RPC:     8400,
 			SerfLan: consul.DefaultLANSerfPort,
 			SerfWan: consul.DefaultWANSerfPort,
 			Server:  8300,
@@ -683,6 +835,7 @@ func DefaultConfig() *Config {
 		Telemetry: Telemetry{
 			StatsitePrefix: "consul",
 		},
+		Meta:                       make(map[string]string),
 		SyslogFacility:             "LOCAL0",
 		Protocol:                   consul.ProtocolVersion2Compatible,
 		CheckUpdateInterval:        5 * time.Minute,
@@ -698,11 +851,16 @@ func DefaultConfig() *Config {
 		SyncCoordinateRateTarget:  64.0, // updates / second
 		SyncCoordinateIntervalMin: 15 * time.Second,
 
-		ACLTTL:           30 * time.Second,
-		ACLDownPolicy:    "extend-cache",
-		ACLDefaultPolicy: "allow",
-		RetryInterval:    30 * time.Second,
-		RetryIntervalWan: 30 * time.Second,
+		ACLTTL:             30 * time.Second,
+		ACLDownPolicy:      "extend-cache",
+		ACLDefaultPolicy:   "allow",
+		ACLDisabledTTL:     120 * time.Second,
+		ACLEnforceVersion8: Bool(true),
+		DisableRemoteExec:  Bool(true),
+		RetryInterval:      30 * time.Second,
+		RetryIntervalWan:   30 * time.Second,
+
+		TLSMinVersion: "tls10",
 	}
 }
 
@@ -714,8 +872,25 @@ func DevConfig() *Config {
 	conf.Server = true
 	conf.EnableDebug = true
 	conf.DisableAnonymousSignature = true
-	conf.EnableUi = true
+	conf.EnableUI = true
 	conf.BindAddr = "127.0.0.1"
+
+	conf.ConsulConfig = consul.DefaultConfig()
+	conf.ConsulConfig.SerfLANConfig.MemberlistConfig.ProbeTimeout = 100 * time.Millisecond
+	conf.ConsulConfig.SerfLANConfig.MemberlistConfig.ProbeInterval = 100 * time.Millisecond
+	conf.ConsulConfig.SerfLANConfig.MemberlistConfig.GossipInterval = 100 * time.Millisecond
+
+	conf.ConsulConfig.SerfWANConfig.MemberlistConfig.SuspicionMult = 3
+	conf.ConsulConfig.SerfWANConfig.MemberlistConfig.ProbeTimeout = 100 * time.Millisecond
+	conf.ConsulConfig.SerfWANConfig.MemberlistConfig.ProbeInterval = 100 * time.Millisecond
+	conf.ConsulConfig.SerfWANConfig.MemberlistConfig.GossipInterval = 100 * time.Millisecond
+
+	conf.ConsulConfig.RaftConfig.LeaderLeaseTimeout = 20 * time.Millisecond
+	conf.ConsulConfig.RaftConfig.HeartbeatTimeout = 40 * time.Millisecond
+	conf.ConsulConfig.RaftConfig.ElectionTimeout = 40 * time.Millisecond
+
+	conf.ConsulConfig.CoordinateUpdatePeriod = 100 * time.Millisecond
+
 	return conf
 }
 
@@ -744,17 +919,71 @@ func (c *Config) ClientListener(override string, port int) (net.Addr, error) {
 	return &net.TCPAddr{IP: ip, Port: port}, nil
 }
 
+// GetTokenForAgent returns the token the agent should use for its own internal
+// operations, such as registering itself with the catalog.
+func (c *Config) GetTokenForAgent() string {
+	if c.ACLAgentToken != "" {
+		return c.ACLAgentToken
+	}
+	if c.ACLToken != "" {
+		return c.ACLToken
+	}
+	return ""
+}
+
+// verifyUniqueListeners checks to see if an address was used more than once in
+// the config
+func (c *Config) verifyUniqueListeners() error {
+	listeners := []struct {
+		host  string
+		port  int
+		descr string
+	}{
+		{c.Addresses.DNS, c.Ports.DNS, "DNS"},
+		{c.Addresses.HTTP, c.Ports.HTTP, "HTTP"},
+		{c.Addresses.HTTPS, c.Ports.HTTPS, "HTTPS"},
+		{c.AdvertiseAddr, c.Ports.Server, "Server RPC"},
+		{c.AdvertiseAddr, c.Ports.SerfLan, "Serf LAN"},
+		{c.AdvertiseAddr, c.Ports.SerfWan, "Serf WAN"},
+	}
+
+	type key struct {
+		host string
+		port int
+	}
+	m := make(map[key]string, len(listeners))
+
+	for _, l := range listeners {
+		if l.host == "" {
+			l.host = "0.0.0.0"
+		} else if strings.HasPrefix(l.host, "unix") {
+			// Don't compare ports on unix sockets
+			l.port = 0
+		}
+		if l.host == "0.0.0.0" && l.port <= 0 {
+			continue
+		}
+
+		k := key{l.host, l.port}
+		v, ok := m[k]
+		if ok {
+			return fmt.Errorf("%s address already configured for %s", l.descr, v)
+		}
+		m[k] = l.descr
+	}
+	return nil
+}
+
 // DecodeConfig reads the configuration from the given reader in JSON
 // format and decodes it into a proper Config structure.
 func DecodeConfig(r io.Reader) (*Config, error) {
 	var raw interface{}
-	var result Config
-	dec := json.NewDecoder(r)
-	if err := dec.Decode(&raw); err != nil {
+	if err := json.NewDecoder(r).Decode(&raw); err != nil {
 		return nil, err
 	}
 
 	// Check the result type
+	var result Config
 	if obj, ok := raw.(map[string]interface{}); ok {
 		// Check for a "services", "service" or "check" key, meaning
 		// this is actually a definition entry
@@ -832,6 +1061,16 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 
 	if err := msdec.Decode(raw); err != nil {
 		return nil, err
+	}
+
+	// Check for deprecations
+	if result.Ports.RPC != 0 {
+		fmt.Fprintln(os.Stderr, "==> DEPRECATION: ports.rpc is deprecated and is "+
+			"no longer used. Please remove it from your configuration.")
+	}
+	if result.Addresses.RPC != "" {
+		fmt.Fprintln(os.Stderr, "==> DEPRECATION: addresses.rpc is deprecated and "+
+			"is no longer used. Please remove it from your configuration.")
 	}
 
 	// Check unused fields and verify that no bad configuration options were
@@ -946,6 +1185,21 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 		result.ReconnectTimeoutWan = dur
 	}
 
+	if raw := result.Autopilot.LastContactThresholdRaw; raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("LastContactThreshold invalid: %v", err)
+		}
+		result.Autopilot.LastContactThreshold = &dur
+	}
+	if raw := result.Autopilot.ServerStabilizationTimeRaw; raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("ServerStabilizationTime invalid: %v", err)
+		}
+		result.Autopilot.ServerStabilizationTime = &dur
+	}
+
 	// Merge the single recursor
 	if result.DNSRecursor != "" {
 		result.DNSRecursors = append(result.DNSRecursors, result.DNSRecursor)
@@ -960,6 +1214,12 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 	}
 
 	if result.AdvertiseAddrs.SerfLanRaw != "" {
+		ipStr, err := parseSingleIPTemplate(result.AdvertiseAddrs.SerfLanRaw)
+		if err != nil {
+			return nil, fmt.Errorf("Serf Advertise LAN address resolution failed: %v", err)
+		}
+		result.AdvertiseAddrs.SerfLanRaw = ipStr
+
 		addr, err := net.ResolveTCPAddr("tcp", result.AdvertiseAddrs.SerfLanRaw)
 		if err != nil {
 			return nil, fmt.Errorf("AdvertiseAddrs.SerfLan is invalid: %v", err)
@@ -968,6 +1228,12 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 	}
 
 	if result.AdvertiseAddrs.SerfWanRaw != "" {
+		ipStr, err := parseSingleIPTemplate(result.AdvertiseAddrs.SerfWanRaw)
+		if err != nil {
+			return nil, fmt.Errorf("Serf Advertise WAN address resolution failed: %v", err)
+		}
+		result.AdvertiseAddrs.SerfWanRaw = ipStr
+
 		addr, err := net.ResolveTCPAddr("tcp", result.AdvertiseAddrs.SerfWanRaw)
 		if err != nil {
 			return nil, fmt.Errorf("AdvertiseAddrs.SerfWan is invalid: %v", err)
@@ -976,6 +1242,12 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 	}
 
 	if result.AdvertiseAddrs.RPCRaw != "" {
+		ipStr, err := parseSingleIPTemplate(result.AdvertiseAddrs.RPCRaw)
+		if err != nil {
+			return nil, fmt.Errorf("RPC Advertise address resolution failed: %v", err)
+		}
+		result.AdvertiseAddrs.RPCRaw = ipStr
+
 		addr, err := net.ResolveTCPAddr("tcp", result.AdvertiseAddrs.RPCRaw)
 		if err != nil {
 			return nil, fmt.Errorf("AdvertiseAddrs.RPC is invalid: %v", err)
@@ -986,6 +1258,14 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 	// Enforce the max Raft multiplier.
 	if result.Performance.RaftMultiplier > consul.MaxRaftMultiplier {
 		return nil, fmt.Errorf("Performance.RaftMultiplier must be <= %d", consul.MaxRaftMultiplier)
+	}
+
+	if raw := result.TLSCipherSuitesRaw; raw != "" {
+		ciphers, err := tlsutil.ParseCiphers(raw)
+		if err != nil {
+			return nil, fmt.Errorf("TLSCipherSuites invalid: %v", err)
+		}
+		result.TLSCipherSuites = ciphers
 	}
 
 	return &result, nil
@@ -1075,44 +1355,44 @@ func FixupCheckType(raw interface{}) error {
 	if ttl, ok := rawMap[ttlKey]; ok {
 		ttlS, ok := ttl.(string)
 		if ok {
-			if dur, err := time.ParseDuration(ttlS); err != nil {
+			dur, err := time.ParseDuration(ttlS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[ttlKey] = dur
 			}
+			rawMap[ttlKey] = dur
 		}
 	}
 
 	if interval, ok := rawMap[intervalKey]; ok {
 		intervalS, ok := interval.(string)
 		if ok {
-			if dur, err := time.ParseDuration(intervalS); err != nil {
+			dur, err := time.ParseDuration(intervalS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[intervalKey] = dur
 			}
+			rawMap[intervalKey] = dur
 		}
 	}
 
 	if timeout, ok := rawMap[timeoutKey]; ok {
 		timeoutS, ok := timeout.(string)
 		if ok {
-			if dur, err := time.ParseDuration(timeoutS); err != nil {
+			dur, err := time.ParseDuration(timeoutS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[timeoutKey] = dur
 			}
+			rawMap[timeoutKey] = dur
 		}
 	}
 
 	if deregister, ok := rawMap[deregisterKey]; ok {
 		timeoutS, ok := deregister.(string)
 		if ok {
-			if dur, err := time.ParseDuration(timeoutS); err != nil {
+			dur, err := time.ParseDuration(timeoutS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[deregisterKey] = dur
 			}
+			rawMap[deregisterKey] = dur
 		}
 	}
 
@@ -1180,6 +1460,15 @@ func MergeConfig(a, b *Config) *Config {
 	if b.Protocol > 0 {
 		result.Protocol = b.Protocol
 	}
+	if b.RaftProtocol > 0 {
+		result.RaftProtocol = b.RaftProtocol
+	}
+	if b.NodeID != "" {
+		result.NodeID = b.NodeID
+	}
+	if b.DisableHostNodeID == true {
+		result.DisableHostNodeID = b.DisableHostNodeID
+	}
 	if b.NodeName != "" {
 		result.NodeName = b.NodeName
 	}
@@ -1219,11 +1508,32 @@ func MergeConfig(a, b *Config) *Config {
 	if b.Server == true {
 		result.Server = b.Server
 	}
+	if b.NonVotingServer == true {
+		result.NonVotingServer = b.NonVotingServer
+	}
 	if b.LeaveOnTerm != nil {
 		result.LeaveOnTerm = b.LeaveOnTerm
 	}
 	if b.SkipLeaveOnInt != nil {
 		result.SkipLeaveOnInt = b.SkipLeaveOnInt
+	}
+	if b.Autopilot.CleanupDeadServers != nil {
+		result.Autopilot.CleanupDeadServers = b.Autopilot.CleanupDeadServers
+	}
+	if b.Autopilot.LastContactThreshold != nil {
+		result.Autopilot.LastContactThreshold = b.Autopilot.LastContactThreshold
+	}
+	if b.Autopilot.MaxTrailingLogs != nil {
+		result.Autopilot.MaxTrailingLogs = b.Autopilot.MaxTrailingLogs
+	}
+	if b.Autopilot.ServerStabilizationTime != nil {
+		result.Autopilot.ServerStabilizationTime = b.Autopilot.ServerStabilizationTime
+	}
+	if b.Autopilot.RedundancyZoneTag != "" {
+		result.Autopilot.RedundancyZoneTag = b.Autopilot.RedundancyZoneTag
+	}
+	if b.Autopilot.DisableUpgradeMigration != nil {
+		result.Autopilot.DisableUpgradeMigration = b.Autopilot.DisableUpgradeMigration
 	}
 	if b.Telemetry.DisableHostname == true {
 		result.Telemetry.DisableHostname = true
@@ -1270,6 +1580,12 @@ func MergeConfig(a, b *Config) *Config {
 	if b.Telemetry.CirconusCheckSearchTag != "" {
 		result.Telemetry.CirconusCheckSearchTag = b.Telemetry.CirconusCheckSearchTag
 	}
+	if b.Telemetry.CirconusCheckDisplayName != "" {
+		result.Telemetry.CirconusCheckDisplayName = b.Telemetry.CirconusCheckDisplayName
+	}
+	if b.Telemetry.CirconusCheckTags != "" {
+		result.Telemetry.CirconusCheckTags = b.Telemetry.CirconusCheckTags
+	}
 	if b.Telemetry.CirconusBrokerID != "" {
 		result.Telemetry.CirconusBrokerID = b.Telemetry.CirconusBrokerID
 	}
@@ -1282,6 +1598,12 @@ func MergeConfig(a, b *Config) *Config {
 	if b.VerifyIncoming {
 		result.VerifyIncoming = true
 	}
+	if b.VerifyIncomingRPC {
+		result.VerifyIncomingRPC = true
+	}
+	if b.VerifyIncomingHTTPS {
+		result.VerifyIncomingHTTPS = true
+	}
 	if b.VerifyOutgoing {
 		result.VerifyOutgoing = true
 	}
@@ -1291,6 +1613,9 @@ func MergeConfig(a, b *Config) *Config {
 	if b.CAFile != "" {
 		result.CAFile = b.CAFile
 	}
+	if b.CAPath != "" {
+		result.CAPath = b.CAPath
+	}
 	if b.CertFile != "" {
 		result.CertFile = b.CertFile
 	}
@@ -1299,6 +1624,15 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.ServerName != "" {
 		result.ServerName = b.ServerName
+	}
+	if b.TLSMinVersion != "" {
+		result.TLSMinVersion = b.TLSMinVersion
+	}
+	if len(b.TLSCipherSuites) != 0 {
+		result.TLSCipherSuites = append(result.TLSCipherSuites, b.TLSCipherSuites...)
+	}
+	if b.TLSPreferServerCipherSuites {
+		result.TLSPreferServerCipherSuites = true
 	}
 	if b.Checks != nil {
 		result.Checks = append(result.Checks, b.Checks...)
@@ -1339,11 +1673,11 @@ func MergeConfig(a, b *Config) *Config {
 	if b.Addresses.RPC != "" {
 		result.Addresses.RPC = b.Addresses.RPC
 	}
-	if b.EnableUi {
-		result.EnableUi = true
+	if b.EnableUI {
+		result.EnableUI = true
 	}
-	if b.UiDir != "" {
-		result.UiDir = b.UiDir
+	if b.UIDir != "" {
+		result.UIDir = b.UIDir
 	}
 	if b.PidFile != "" {
 		result.PidFile = b.PidFile
@@ -1374,6 +1708,18 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.RetryJoinEC2.TagValue != "" {
 		result.RetryJoinEC2.TagValue = b.RetryJoinEC2.TagValue
+	}
+	if b.RetryJoinGCE.ProjectName != "" {
+		result.RetryJoinGCE.ProjectName = b.RetryJoinGCE.ProjectName
+	}
+	if b.RetryJoinGCE.ZonePattern != "" {
+		result.RetryJoinGCE.ZonePattern = b.RetryJoinGCE.ZonePattern
+	}
+	if b.RetryJoinGCE.TagValue != "" {
+		result.RetryJoinGCE.TagValue = b.RetryJoinGCE.TagValue
+	}
+	if b.RetryJoinGCE.CredentialsFile != "" {
+		result.RetryJoinGCE.CredentialsFile = b.RetryJoinGCE.CredentialsFile
 	}
 	if b.RetryMaxAttemptsWan != 0 {
 		result.RetryMaxAttemptsWan = b.RetryMaxAttemptsWan
@@ -1430,6 +1776,12 @@ func MergeConfig(a, b *Config) *Config {
 	if b.ACLToken != "" {
 		result.ACLToken = b.ACLToken
 	}
+	if b.ACLAgentMasterToken != "" {
+		result.ACLAgentMasterToken = b.ACLAgentMasterToken
+	}
+	if b.ACLAgentToken != "" {
+		result.ACLAgentToken = b.ACLAgentToken
+	}
 	if b.ACLMasterToken != "" {
 		result.ACLMasterToken = b.ACLMasterToken
 	}
@@ -1449,14 +1801,17 @@ func MergeConfig(a, b *Config) *Config {
 	if b.ACLReplicationToken != "" {
 		result.ACLReplicationToken = b.ACLReplicationToken
 	}
+	if b.ACLEnforceVersion8 != nil {
+		result.ACLEnforceVersion8 = b.ACLEnforceVersion8
+	}
 	if len(b.Watches) != 0 {
 		result.Watches = append(result.Watches, b.Watches...)
 	}
 	if len(b.WatchPlans) != 0 {
 		result.WatchPlans = append(result.WatchPlans, b.WatchPlans...)
 	}
-	if b.DisableRemoteExec {
-		result.DisableRemoteExec = true
+	if b.DisableRemoteExec != nil {
+		result.DisableRemoteExec = b.DisableRemoteExec
 	}
 	if b.DisableUpdateCheck {
 		result.DisableUpdateCheck = true
@@ -1501,6 +1856,14 @@ func MergeConfig(a, b *Config) *Config {
 		}
 		for field, value := range b.HTTPAPIResponseHeaders {
 			result.HTTPAPIResponseHeaders[field] = value
+		}
+	}
+	if len(b.Meta) != 0 {
+		if result.Meta == nil {
+			result.Meta = make(map[string]string)
+		}
+		for field, value := range b.Meta {
+			result.Meta[field] = value
 		}
 	}
 
@@ -1612,4 +1975,24 @@ func (d dirEnts) Less(i, j int) bool {
 
 func (d dirEnts) Swap(i, j int) {
 	d[i], d[j] = d[j], d[i]
+}
+
+// isAddrANY checks if the given ip address is an IPv4 or IPv6 ANY address. ip
+// can be either a *net.IP or a string. It panics on another type.
+func isAddrANY(ip interface{}) bool {
+	if ip == nil {
+		return false
+	}
+	var ips string
+	switch x := ip.(type) {
+	case net.IP:
+		ips = x.String()
+	case *net.IP:
+		ips = x.String()
+	case string:
+		ips = x
+	default:
+		panic(fmt.Sprintf("invalid type: %T", ip))
+	}
+	return ips == "0.0.0.0" || ips == "::" || ips == "[::]"
 }

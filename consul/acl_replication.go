@@ -46,9 +46,8 @@ func (a *aclIterator) Less(i, j int) bool {
 func (a *aclIterator) Front() *structs.ACL {
 	if a.index < len(a.acls) {
 		return a.acls[a.index]
-	} else {
-		return nil
 	}
+	return nil
 }
 
 // Next advances the iterator to the next index.
@@ -139,7 +138,7 @@ func reconcileACLs(local, remote structs.ACLs, lastRemoteIndex uint64) structs.A
 
 // FetchLocalACLs returns the ACLs in the local state store.
 func (s *Server) fetchLocalACLs() (structs.ACLs, error) {
-	_, local, err := s.fsm.State().ACLList()
+	_, local, err := s.fsm.State().ACLList(nil)
 	if err != nil {
 		return nil, err
 	}

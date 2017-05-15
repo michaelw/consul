@@ -7,7 +7,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/tlsutil"
+	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
@@ -15,6 +17,7 @@ import (
 
 const (
 	DefaultDC          = "dc1"
+	DefaultRPCPort     = 8300
 	DefaultLANSerfPort = 8301
 	DefaultWANSerfPort = 8302
 
@@ -29,13 +32,13 @@ const (
 )
 
 var (
-	DefaultRPCAddr = &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 8300}
-)
+	DefaultRPCAddr = &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: DefaultRPCPort}
 
-// ProtocolVersionMap is the mapping of Consul protocol versions
-// to Serf protocol versions. We mask the Serf protocols using
-// our own protocol version.
-var protocolVersionMap map[uint8]uint8
+	// ProtocolVersionMap is the mapping of Consul protocol versions
+	// to Serf protocol versions. We mask the Serf protocols using
+	// our own protocol version.
+	protocolVersionMap map[uint8]uint8
+)
 
 func init() {
 	protocolVersionMap = map[uint8]uint8{
@@ -66,6 +69,9 @@ type Config struct {
 	// DevMode is used to enable a development server mode.
 	DevMode bool
 
+	// NodeID is a unique identifier for this node across space and time.
+	NodeID types.NodeID
+
 	// Node name is the name we use to advertise. Defaults to hostname.
 	NodeName string
 
@@ -74,6 +80,10 @@ type Config struct {
 
 	// RaftConfig is the configuration used for Raft in the local DC
 	RaftConfig *raft.Config
+
+	// (Enterprise-only) NonVoter is used to prevent this server from being added
+	// as a voting member of the Raft cluster.
+	NonVoter bool
 
 	// RPCAddr is the RPC address used by Consul. This should be reachable
 	// by the WAN and LAN
@@ -85,11 +95,20 @@ type Config struct {
 	// reachable
 	RPCAdvertise *net.TCPAddr
 
+	// RPCSrcAddr is the source address for outgoing RPC connections.
+	// It is RPCAdvertise with the port set to zero.
+	RPCSrcAddr *net.TCPAddr
+
 	// SerfLANConfig is the configuration for the intra-dc serf
 	SerfLANConfig *serf.Config
 
 	// SerfWANConfig is the configuration for the cross-dc serf
 	SerfWANConfig *serf.Config
+
+	// SerfFloodInterval controls how often we attempt to flood local Serf
+	// Consul servers into the global areas (WAN and user-defined areas in
+	// Consul Enterprise).
+	SerfFloodInterval time.Duration
 
 	// ReconcileInterval controls how often we reconcile the strongly
 	// consistent store with the Serf info. This is used to handle nodes
@@ -128,6 +147,10 @@ type Config struct {
 	// or VerifyOutgoing to verify the TLS connection.
 	CAFile string
 
+	// CAPath is a path to a directory of certificate authority files. This is used with
+	// VerifyIncoming or VerifyOutgoing to verify the TLS connection.
+	CAPath string
+
 	// CertFile is used to provide a TLS certificate that is used for serving TLS connections.
 	// Must be provided to serve TLS connections.
 	CertFile string
@@ -139,6 +162,16 @@ type Config struct {
 	// ServerName is used with the TLS certificate to ensure the name we
 	// provide matches the certificate
 	ServerName string
+
+	// TLSMinVersion is used to set the minimum TLS version used for TLS connections.
+	TLSMinVersion string
+
+	// TLSCipherSuites is used to specify the list of supported ciphersuites.
+	TLSCipherSuites []uint16
+
+	// TLSPreferServerCipherSuites specifies whether to prefer the server's ciphersuite
+	// over the client ciphersuites.
+	TLSPreferServerCipherSuites bool
 
 	// RejoinAfterLeave controls our interaction with Serf.
 	// When set to false (default), a leave causes a Consul to not rejoin
@@ -154,6 +187,11 @@ type Config struct {
 	// If not provided, the anonymous token is used. This enables
 	// backwards compatibility as well.
 	ACLToken string
+
+	// ACLAgentToken is the default token used to make requests for the agent
+	// itself, such as for registering itself with the catalog. If not
+	// configured, the ACLToken will be used.
+	ACLAgentToken string
 
 	// ACLMasterToken is used to bootstrap the ACL system. It should be specified
 	// on the servers in the ACLDatacenter. When the leader comes online, it ensures
@@ -200,6 +238,10 @@ type Config struct {
 	// used to limit the amount of Raft bandwidth used for replication.
 	ACLReplicationApplyLimit int
 
+	// ACLEnforceVersion8 is used to gate a set of ACL policy features that
+	// are opt-in prior to Consul 0.8 and opt-out in Consul 0.8 and later.
+	ACLEnforceVersion8 bool
+
 	// TombstoneTTL is used to control how long KV tombstones are retained.
 	// This provides a window of time where the X-Consul-Index is monotonic.
 	// Outside this window, the index may not be monotonic. This is a result
@@ -234,9 +276,6 @@ type Config struct {
 	// user events. This function should not block.
 	UserEventHandler func(serf.UserEvent)
 
-	// DisableCoordinates controls features related to network coordinates.
-	DisableCoordinates bool
-
 	// CoordinateUpdatePeriod controls how long a server batches coordinate
 	// updates before applying them in a Raft transaction. A larger period
 	// leads to fewer Raft transactions, but also the stored coordinates
@@ -258,21 +297,33 @@ type Config struct {
 	// This period is meant to be long enough for a leader election to take
 	// place, and a small jitter is applied to avoid a thundering herd.
 	RPCHoldTimeout time.Duration
+
+	// AutopilotConfig is used to apply the initial autopilot config when
+	// bootstrapping.
+	AutopilotConfig *structs.AutopilotConfig
+
+	// ServerHealthInterval is the frequency with which the health of the
+	// servers in the cluster will be updated.
+	ServerHealthInterval time.Duration
+
+	// AutopilotInterval is the frequency with which the leader will perform
+	// autopilot tasks, such as promoting eligible non-voters and removing
+	// dead servers.
+	AutopilotInterval time.Duration
 }
 
-// CheckVersion is used to check if the ProtocolVersion is valid
-func (c *Config) CheckVersion() error {
+// CheckProtocolVersion validates the protocol version.
+func (c *Config) CheckProtocolVersion() error {
 	if c.ProtocolVersion < ProtocolVersionMin {
-		return fmt.Errorf("Protocol version '%d' too low. Must be in range: [%d, %d]",
-			c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
-	} else if c.ProtocolVersion > ProtocolVersionMax {
-		return fmt.Errorf("Protocol version '%d' too high. Must be in range: [%d, %d]",
-			c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
+		return fmt.Errorf("Protocol version '%d' too low. Must be in range: [%d, %d]", c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
+	}
+	if c.ProtocolVersion > ProtocolVersionMax {
+		return fmt.Errorf("Protocol version '%d' too high. Must be in range: [%d, %d]", c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
 	}
 	return nil
 }
 
-// CheckACL is used to sanity check the ACL configuration
+// CheckACL validates the ACL configuration.
 func (c *Config) CheckACL() error {
 	switch c.ACLDefaultPolicy {
 	case "allow":
@@ -290,7 +341,7 @@ func (c *Config) CheckACL() error {
 	return nil
 }
 
-// DefaultConfig is used to return a sane default configuration
+// DefaultConfig returns a sane default configuration.
 func DefaultConfig() *Config {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -298,12 +349,14 @@ func DefaultConfig() *Config {
 	}
 
 	conf := &Config{
+		Build:                    "0.8.0",
 		Datacenter:               DefaultDC,
 		NodeName:                 hostname,
 		RPCAddr:                  DefaultRPCAddr,
 		RaftConfig:               raft.DefaultConfig(),
 		SerfLANConfig:            serf.DefaultConfig(),
 		SerfWANConfig:            serf.DefaultConfig(),
+		SerfFloodInterval:        60 * time.Second,
 		ReconcileInterval:        60 * time.Second,
 		ProtocolVersion:          ProtocolVersion2Compatible,
 		ACLTTL:                   30 * time.Second,
@@ -314,7 +367,6 @@ func DefaultConfig() *Config {
 		TombstoneTTL:             15 * time.Minute,
 		TombstoneTTLGranularity:  30 * time.Second,
 		SessionTTLMin:            10 * time.Second,
-		DisableCoordinates:       false,
 
 		// These are tuned to provide a total throughput of 128 updates
 		// per second. If you update these, you should update the client-
@@ -328,6 +380,17 @@ func DefaultConfig() *Config {
 		// bit longer to try to cover that period. This should be more
 		// than enough when running in the high performance mode.
 		RPCHoldTimeout: 7 * time.Second,
+
+		TLSMinVersion: "tls10",
+
+		AutopilotConfig: &structs.AutopilotConfig{
+			CleanupDeadServers:      true,
+			LastContactThreshold:    200 * time.Millisecond,
+			MaxTrailingLogs:         250,
+			ServerStabilizationTime: 10 * time.Second,
+		},
+		ServerHealthInterval: 2 * time.Second,
+		AutopilotInterval:    10 * time.Second,
 	}
 
 	// Increase our reap interval to 3 days instead of 24h.
@@ -342,13 +405,17 @@ func DefaultConfig() *Config {
 	conf.SerfLANConfig.MemberlistConfig.BindPort = DefaultLANSerfPort
 	conf.SerfWANConfig.MemberlistConfig.BindPort = DefaultWANSerfPort
 
-	// Enable interoperability with unversioned Raft library, and don't
-	// start using new ID-based features yet.
-	conf.RaftConfig.ProtocolVersion = 1
+	// TODO: default to 3 in Consul 0.9
+	// Use a transitional version of the raft protocol to interoperate with
+	// versions 1 and 3
+	conf.RaftConfig.ProtocolVersion = 2
 	conf.ScaleRaft(DefaultRaftMultiplier)
 
 	// Disable shutdown on removal
 	conf.RaftConfig.ShutdownOnRemove = false
+
+	// Check every 5 seconds to see if there are enough new entries for a snapshot
+	conf.RaftConfig.SnapshotInterval = 5 * time.Second
 
 	return conf
 }
@@ -366,17 +433,33 @@ func (c *Config) ScaleRaft(raftMultRaw uint) {
 	c.RaftConfig.LeaderLeaseTimeout = raftMult * def.LeaderLeaseTimeout
 }
 
+// tlsConfig maps this config into a tlsutil config.
 func (c *Config) tlsConfig() *tlsutil.Config {
 	tlsConf := &tlsutil.Config{
-		VerifyIncoming:       c.VerifyIncoming,
-		VerifyOutgoing:       c.VerifyOutgoing,
-		VerifyServerHostname: c.VerifyServerHostname,
-		CAFile:               c.CAFile,
-		CertFile:             c.CertFile,
-		KeyFile:              c.KeyFile,
-		NodeName:             c.NodeName,
-		ServerName:           c.ServerName,
-		Domain:               c.Domain,
+		VerifyIncoming:           c.VerifyIncoming,
+		VerifyOutgoing:           c.VerifyOutgoing,
+		VerifyServerHostname:     c.VerifyServerHostname,
+		CAFile:                   c.CAFile,
+		CAPath:                   c.CAPath,
+		CertFile:                 c.CertFile,
+		KeyFile:                  c.KeyFile,
+		NodeName:                 c.NodeName,
+		ServerName:               c.ServerName,
+		Domain:                   c.Domain,
+		TLSMinVersion:            c.TLSMinVersion,
+		PreferServerCipherSuites: c.TLSPreferServerCipherSuites,
 	}
 	return tlsConf
+}
+
+// GetTokenForAgent returns the token the agent should use for its own internal
+// operations, such as registering itself with the catalog.
+func (c *Config) GetTokenForAgent() string {
+	if c.ACLAgentToken != "" {
+		return c.ACLAgentToken
+	}
+	if c.ACLToken != "" {
+		return c.ACLToken
+	}
+	return ""
 }
