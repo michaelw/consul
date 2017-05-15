@@ -1,5 +1,13 @@
+consul (0.8.3-1) precise; urgency=low
+
+  * Rebase onto v0.8.3, use golang 1.8
+  * Add debian/gbp.conf
+
+ -- Michael Weber <mweber@instartlogic.com>  Sun, 14 May 2017 23:04:00 -0700
+
 consul (0.7.1-2) precise; urgency=medium
 
+  [ Scott Beardsley ]
   * make consul "server" opt-in
   * remove minimum bootstrap_expect=3
 
