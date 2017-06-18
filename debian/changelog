@@ -1,3 +1,9 @@
+consul (0.8.4-1) precise; urgency=low
+
+  * new upstream release
+
+ -- Michael Weber <mweber@instartlogic.com>  Sat, 17 Jun 2017 20:09:40 -0700
+
 consul (0.8.3-1) precise; urgency=low
 
   * Rebase onto v0.8.3, use golang 1.8
