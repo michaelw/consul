@@ -1,3 +1,10 @@
+consul (1.0.0-1instart1) precise; urgency=low
+
+  * new upstream release 1.0.0
+  * increase minimal go version to 1.9
+
+ -- Michael Weber <mweber@instartlogic.com>  Wed, 08 Nov 2017 20:44:47 -0800
+
 consul (0.9.0-1) precise; urgency=low
 
   * new upstream release
