@@ -9,7 +9,7 @@
 /pkg
 Thumbs.db
 bin/
-consul
+changelog.tmp
 exit-code
 ui/.bundle
 ui/.sass-cache

@@ -48,7 +48,7 @@ The table below shows this endpoint's support for
 - `TaggedAddresses` `(map<string|string>: nil)` - Specifies the tagged
   addresses.
 
-- `Meta` `(map<string|string>: nil)` - Specifies arbitrary KV metadata
+- `NodeMeta` `(map<string|string>: nil)` - Specifies arbitrary KV metadata
   pairs for filtering purposes.
 
 - `Service` `(Service: nil)` - Specifies to register a service. If `ID` is not
@@ -314,7 +314,7 @@ The table below shows this endpoint's support for
 
 | Blocking Queries | Consistency Modes | ACL Required   |
 | ---------------- | ----------------- | -------------- |
-| `TEST`           | `all`             | `service:read` |
+| `YES`            | `all`             | `service:read` |
 
 ### Parameters
 
@@ -408,8 +408,8 @@ $ curl \
       "lan": "192.168.10.10",
       "wan": "10.0.10.10"
     },
-    "Meta": {
-      "instance_type": "t2.medium"
+    "NodeMeta": {
+      "somekey": "somevalue"
     },
     "CreateIndex": 51,
     "ModifyIndex": 51,
@@ -434,7 +434,7 @@ $ curl \
 - `TaggedAddresses` is the list of explicit LAN and WAN IP addresses for the
   agent
 
-- `Meta` is a list of user-defined metadata key/value pairs for the node
+- `NodeMeta` is a list of user-defined metadata key/value pairs for the node
 
 - `CreateIndex` is an internal index value representing when the service was
   created

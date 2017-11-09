@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/config"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/testutil/retry"
@@ -77,6 +78,18 @@ func dnsA(src, dest string) *dns.A {
 	}
 }
 
+// dnsTXT returns a DNS TXT record struct
+func dnsTXT(src string, txt []string) *dns.TXT {
+	return &dns.TXT{
+		Hdr: dns.RR_Header{
+			Name:   dns.Fqdn(src),
+			Rrtype: dns.TypeTXT,
+			Class:  dns.ClassINET,
+		},
+		Txt: txt,
+	}
+}
+
 func TestRecursorAddr(t *testing.T) {
 	t.Parallel()
 	addr, err := recursorAddr("8.8.8.8")
@@ -88,9 +101,38 @@ func TestRecursorAddr(t *testing.T) {
 	}
 }
 
+func TestEncodeKVasRFC1464(t *testing.T) {
+	// Test cases are from rfc1464
+	type rfc1464Test struct {
+		key, value, internalForm, externalForm string
+	}
+	tests := []rfc1464Test{
+		{"color", "blue", "color=blue", "color=blue"},
+		{"equation", "a=4", "equation=a=4", "equation=a=4"},
+		{"a=a", "true", "a`=a=true", "a`=a=true"},
+		{"a\\=a", "false", "a\\`=a=false", "a\\`=a=false"},
+		{"=", "\\=", "`==\\=", "`==\\="},
+
+		{"string", "\"Cat\"", "string=\"Cat\"", "string=\"Cat\""},
+		{"string2", "`abc`", "string2=``abc``", "string2=``abc``"},
+		{"novalue", "", "novalue=", "novalue="},
+		{"a b", "c d", "a b=c d", "a b=c d"},
+		{"abc ", "123 ", "abc` =123 ", "abc` =123 "},
+
+		// Additional tests
+		{" abc", " 321", "` abc= 321", "` abc= 321"},
+		{"`a", "b", "``a=b", "``a=b"},
+	}
+
+	for _, test := range tests {
+		answer := encodeKVasRFC1464(test.key, test.value)
+		verify.Values(t, "internalForm", answer, test.internalForm)
+	}
+}
+
 func TestDNS_NodeLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -112,8 +154,7 @@ func TestDNS_NodeLookup(t *testing.T) {
 	m.SetQuestion("foo.node.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -138,7 +179,7 @@ func TestDNS_NodeLookup(t *testing.T) {
 	m.SetQuestion("foo.node.dc1.consul.", dns.TypeANY)
 
 	c = new(dns.Client)
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -163,7 +204,7 @@ func TestDNS_NodeLookup(t *testing.T) {
 	m.SetQuestion("nofoo.node.dc1.consul.", dns.TypeANY)
 
 	c = new(dns.Client)
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -179,11 +220,12 @@ func TestDNS_NodeLookup(t *testing.T) {
 	if soaRec.Hdr.Ttl != 0 {
 		t.Fatalf("Bad: %#v", in.Ns[0])
 	}
+
 }
 
 func TestDNS_CaseInsensitiveNodeLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -202,8 +244,7 @@ func TestDNS_CaseInsensitiveNodeLookup(t *testing.T) {
 	m.SetQuestion("fOO.node.dc1.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -215,7 +256,7 @@ func TestDNS_CaseInsensitiveNodeLookup(t *testing.T) {
 
 func TestDNS_NodeLookup_PeriodName(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node with period in name
@@ -234,8 +275,7 @@ func TestDNS_NodeLookup_PeriodName(t *testing.T) {
 	m.SetQuestion("foo.bar.node.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -255,7 +295,7 @@ func TestDNS_NodeLookup_PeriodName(t *testing.T) {
 
 func TestDNS_NodeLookup_AAAA(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -274,8 +314,7 @@ func TestDNS_NodeLookup_AAAA(t *testing.T) {
 	m.SetQuestion("bar.node.consul.", dns.TypeAAAA)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -302,13 +341,14 @@ func TestDNS_NodeLookup_CNAME(t *testing.T) {
 		Answer: []dns.RR{
 			dnsCNAME("www.google.com", "google.com"),
 			dnsA("google.com", "1.2.3.4"),
+			dnsTXT("google.com", []string{"my_txt_value"}),
 		},
 	})
 	defer recursor.Shutdown()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = recursor.Addr
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+recursor.Addr+`"]
+	`)
 	defer a.Shutdown()
 
 	// Register node
@@ -327,32 +367,121 @@ func TestDNS_NodeLookup_CNAME(t *testing.T) {
 	m.SetQuestion("google.node.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Should have the service record, CNAME record + A record
-	if len(in.Answer) != 3 {
+	wantAnswer := []dns.RR{
+		&dns.CNAME{
+			Hdr:    dns.RR_Header{Name: "google.node.consul.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 0, Rdlength: 0x10},
+			Target: "www.google.com.",
+		},
+		&dns.CNAME{
+			Hdr:    dns.RR_Header{Name: "www.google.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Rdlength: 0x2},
+			Target: "google.com.",
+		},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "google.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Rdlength: 0x4},
+			A:   []byte{0x1, 0x2, 0x3, 0x4}, // 1.2.3.4
+		},
+		&dns.TXT{
+			Hdr: dns.RR_Header{Name: "google.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Rdlength: 0xd},
+			Txt: []string{"my_txt_value"},
+		},
+	}
+	verify.Values(t, "answer", in.Answer, wantAnswer)
+}
+
+func TestDNS_NodeLookup_TXT(t *testing.T) {
+	a := NewTestAgent(t.Name(), ``)
+	defer a.Shutdown()
+
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "google",
+		Address:    "127.0.0.1",
+		NodeMeta: map[string]string{
+			"rfc1035-00": "value0",
+			"key0":       "value1",
+		},
+	}
+
+	var out struct{}
+	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	m := new(dns.Msg)
+	m.SetQuestion("google.node.consul.", dns.TypeTXT)
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, a.DNSAddr())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Should have the 1 TXT record reply
+	if len(in.Answer) != 2 {
 		t.Fatalf("Bad: %#v", in)
 	}
 
-	cnRec, ok := in.Answer[0].(*dns.CNAME)
+	txtRec, ok := in.Answer[0].(*dns.TXT)
 	if !ok {
 		t.Fatalf("Bad: %#v", in.Answer[0])
 	}
-	if cnRec.Target != "www.google.com." {
+	if len(txtRec.Txt) != 1 {
 		t.Fatalf("Bad: %#v", in.Answer[0])
 	}
-	if cnRec.Hdr.Ttl != 0 {
+	if txtRec.Txt[0] != "value0" && txtRec.Txt[0] != "key0=value1" {
 		t.Fatalf("Bad: %#v", in.Answer[0])
 	}
 }
 
+func TestDNS_NodeLookup_ANY(t *testing.T) {
+	a := NewTestAgent(t.Name(), ``)
+	defer a.Shutdown()
+
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "bar",
+		Address:    "127.0.0.1",
+		NodeMeta: map[string]string{
+			"key": "value",
+		},
+	}
+
+	var out struct{}
+	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	m := new(dns.Msg)
+	m.SetQuestion("bar.node.consul.", dns.TypeANY)
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, a.DNSAddr())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	wantAnswer := []dns.RR{
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "bar.node.consul.", Rrtype: dns.TypeA, Class: dns.ClassINET, Rdlength: 0x4},
+			A:   []byte{0x7f, 0x0, 0x0, 0x1}, // 127.0.0.1
+		},
+		&dns.TXT{
+			Hdr: dns.RR_Header{Name: "bar.node.consul.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Rdlength: 0xa},
+			Txt: []string{"key=value"},
+		},
+	}
+	verify.Values(t, "answer", in.Answer, wantAnswer)
+
+}
+
 func TestDNS_EDNS0(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -372,8 +501,7 @@ func TestDNS_EDNS0(t *testing.T) {
 	m.SetQuestion("foo.node.dc1.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -392,7 +520,7 @@ func TestDNS_EDNS0(t *testing.T) {
 
 func TestDNS_ReverseLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -411,8 +539,7 @@ func TestDNS_ReverseLookup(t *testing.T) {
 	m.SetQuestion("2.0.0.127.in-addr.arpa.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -432,9 +559,9 @@ func TestDNS_ReverseLookup(t *testing.T) {
 
 func TestDNS_ReverseLookup_CustomDomain(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.Domain = "custom"
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		domain = "custom"
+	`)
 	defer a.Shutdown()
 
 	// Register node
@@ -453,8 +580,7 @@ func TestDNS_ReverseLookup_CustomDomain(t *testing.T) {
 	m.SetQuestion("2.0.0.127.in-addr.arpa.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -474,7 +600,7 @@ func TestDNS_ReverseLookup_CustomDomain(t *testing.T) {
 
 func TestDNS_ReverseLookup_IPV6(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -493,8 +619,7 @@ func TestDNS_ReverseLookup_IPV6(t *testing.T) {
 	m.SetQuestion("2.4.2.4.2.4.2.4.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -514,7 +639,7 @@ func TestDNS_ReverseLookup_IPV6(t *testing.T) {
 
 func TestDNS_ServiceLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -564,8 +689,7 @@ func TestDNS_ServiceLookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -613,8 +737,7 @@ func TestDNS_ServiceLookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -630,12 +753,15 @@ func TestDNS_ServiceLookup(t *testing.T) {
 		if soaRec.Hdr.Ttl != 0 {
 			t.Fatalf("Bad: %#v", in.Ns[0])
 		}
+
 	}
 }
 
 func TestDNS_ServiceLookupWithInternalServiceAddress(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), `
+		node_name = "my.test-node"
+	`)
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -663,15 +789,14 @@ func TestDNS_ServiceLookupWithInternalServiceAddress(t *testing.T) {
 	m.SetQuestion("db.service.consul.", dns.TypeSRV)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	wantAnswer := []dns.RR{
 		&dns.SRV{
-			Hdr:      dns.RR_Header{Name: "db.service.consul.", Rrtype: 0x21, Class: 0x1, Rdlength: 0x15},
+			Hdr:      dns.RR_Header{Name: "db.service.consul.", Rrtype: 0x21, Class: 0x1, Rdlength: 0x1b},
 			Priority: 0x1,
 			Weight:   0x1,
 			Port:     12345,
@@ -679,7 +804,6 @@ func TestDNS_ServiceLookupWithInternalServiceAddress(t *testing.T) {
 		},
 	}
 	verify.Values(t, "answer", in.Answer, wantAnswer)
-
 	wantExtra := []dns.RR{
 		&dns.CNAME{
 			Hdr:    dns.RR_Header{Name: "foo.node.dc1.consul.", Rrtype: 0x5, Class: 0x1, Rdlength: 0x2},
@@ -695,7 +819,7 @@ func TestDNS_ServiceLookupWithInternalServiceAddress(t *testing.T) {
 
 func TestDNS_ExternalServiceLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with an external service.
@@ -725,8 +849,7 @@ func TestDNS_ExternalServiceLookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -767,9 +890,10 @@ func TestDNS_ExternalServiceLookup(t *testing.T) {
 
 func TestDNS_ExternalServiceToConsulCNAMELookup(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.Domain = "CONSUL."
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		domain = "CONSUL."
+		node_name = "test node"
+	`)
 	defer a.Shutdown()
 
 	// Register the initial node with a service
@@ -818,8 +942,7 @@ func TestDNS_ExternalServiceToConsulCNAMELookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -873,12 +996,85 @@ func TestDNS_ExternalServiceToConsulCNAMELookup(t *testing.T) {
 		if aRec.Hdr.Ttl != 0 {
 			t.Fatalf("Bad: %#v", in.Extra[1])
 		}
+
 	}
+}
+
+func TestDNS_NSRecords(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t.Name(), `
+		domain = "CONSUL."
+		node_name = "server1"
+	`)
+	defer a.Shutdown()
+
+	m := new(dns.Msg)
+	m.SetQuestion("something.node.consul.", dns.TypeNS)
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, a.DNSAddr())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	wantAnswer := []dns.RR{
+		&dns.NS{
+			Hdr: dns.RR_Header{Name: "consul.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 0, Rdlength: 0x13},
+			Ns:  "server1.node.dc1.consul.",
+		},
+	}
+	verify.Values(t, "answer", in.Answer, wantAnswer)
+	wantExtra := []dns.RR{
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "server1.node.dc1.consul.", Rrtype: dns.TypeA, Class: dns.ClassINET, Rdlength: 0x4, Ttl: 0},
+			A:   net.ParseIP("127.0.0.1").To4(),
+		},
+	}
+
+	verify.Values(t, "extra", in.Extra, wantExtra)
+}
+
+func TestDNS_NSRecords_IPV6(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t.Name(), `
+ 		domain = "CONSUL."
+ 		node_name = "server1"
+ 		advertise_addr = "::1"
+ 	`)
+	defer a.Shutdown()
+
+	m := new(dns.Msg)
+	m.SetQuestion("server1.node.dc1.consul.", dns.TypeNS)
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, a.DNSAddr())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	wantAnswer := []dns.RR{
+		&dns.NS{
+			Hdr: dns.RR_Header{Name: "consul.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 0, Rdlength: 0x2},
+			Ns:  "server1.node.dc1.consul.",
+		},
+	}
+	verify.Values(t, "answer", in.Answer, wantAnswer)
+	wantExtra := []dns.RR{
+		&dns.AAAA{
+			Hdr:  dns.RR_Header{Name: "server1.node.dc1.consul.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Rdlength: 0x10, Ttl: 0},
+			AAAA: net.ParseIP("::1"),
+		},
+	}
+
+	verify.Values(t, "extra", in.Extra, wantExtra)
+
 }
 
 func TestDNS_ExternalServiceToConsulCNAMENestedLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), `
+		node_name = "test-node"
+	`)
 	defer a.Shutdown()
 
 	// Register the initial node with a service
@@ -944,8 +1140,7 @@ func TestDNS_ExternalServiceToConsulCNAMENestedLookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1018,7 +1213,7 @@ func TestDNS_ExternalServiceToConsulCNAMENestedLookup(t *testing.T) {
 
 func TestDNS_ServiceLookup_ServiceAddress_A(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -1069,8 +1264,7 @@ func TestDNS_ServiceLookup_ServiceAddress_A(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1111,7 +1305,7 @@ func TestDNS_ServiceLookup_ServiceAddress_A(t *testing.T) {
 
 func TestDNS_ServiceLookup_ServiceAddress_CNAME(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service whose address isn't an IP.
@@ -1162,8 +1356,7 @@ func TestDNS_ServiceLookup_ServiceAddress_CNAME(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1204,7 +1397,7 @@ func TestDNS_ServiceLookup_ServiceAddress_CNAME(t *testing.T) {
 
 func TestDNS_ServiceLookup_ServiceAddressIPV6(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -1255,8 +1448,7 @@ func TestDNS_ServiceLookup_ServiceAddressIPV6(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1297,22 +1489,22 @@ func TestDNS_ServiceLookup_ServiceAddressIPV6(t *testing.T) {
 
 func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 	t.Parallel()
-	cfg1 := TestConfig()
-	cfg1.Datacenter = "dc1"
-	cfg1.TranslateWanAddrs = true
-	cfg1.ACLDatacenter = ""
-	a1 := NewTestAgent(t.Name(), cfg1)
+	a1 := NewTestAgent(t.Name(), `
+		datacenter = "dc1"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a1.Shutdown()
 
-	cfg2 := TestConfig()
-	cfg2.Datacenter = "dc2"
-	cfg2.TranslateWanAddrs = true
-	cfg2.ACLDatacenter = ""
-	a2 := NewTestAgent(t.Name(), cfg2)
+	a2 := NewTestAgent(t.Name(), `
+		datacenter = "dc2"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a2.Shutdown()
 
 	// Join WAN cluster
-	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.Ports.SerfWan)
+	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.SerfPortWAN)
 	if _, err := a2.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1375,7 +1567,8 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a1.Config.ClientListener("", a1.Config.Ports.DNS)
+
+		addr := a1.config.DNSAddrs[0]
 		in, _, err := c.Exchange(m, addr.String())
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -1403,7 +1596,7 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 		m.SetQuestion(question, dns.TypeA)
 
 		c := new(dns.Client)
-		addr, _ := a1.Config.ClientListener("", a1.Config.Ports.DNS)
+		addr := a1.config.DNSAddrs[0]
 		in, _, err := c.Exchange(m, addr.String())
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -1431,7 +1624,7 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a2.Config.ClientListener("", a2.Config.Ports.DNS)
+		addr := a2.Config.DNSAddrs[0]
 		in, _, err := c.Exchange(m, addr.String())
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -1459,7 +1652,7 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 		m.SetQuestion(question, dns.TypeA)
 
 		c := new(dns.Client)
-		addr, _ := a2.Config.ClientListener("", a2.Config.Ports.DNS)
+		addr := a2.Config.DNSAddrs[0]
 		in, _, err := c.Exchange(m, addr.String())
 		if err != nil {
 			t.Fatalf("err: %v", err)
@@ -1484,7 +1677,7 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 
 func TestDNS_CaseInsensitiveServiceLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -1541,8 +1734,7 @@ func TestDNS_CaseInsensitiveServiceLookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1555,7 +1747,7 @@ func TestDNS_CaseInsensitiveServiceLookup(t *testing.T) {
 
 func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -1579,8 +1771,7 @@ func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
 	m.SetQuestion("v1.master.db.service.consul.", dns.TypeSRV)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1614,7 +1805,7 @@ func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
 
 func TestDNS_ServiceLookup_PreparedQueryNamePeriod(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -1658,8 +1849,7 @@ func TestDNS_ServiceLookup_PreparedQueryNamePeriod(t *testing.T) {
 	m.SetQuestion("some.query.we.like.query.consul.", dns.TypeSRV)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1693,7 +1883,7 @@ func TestDNS_ServiceLookup_PreparedQueryNamePeriod(t *testing.T) {
 
 func TestDNS_ServiceLookup_Dedup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a single node with multiple instances of a service.
@@ -1774,8 +1964,7 @@ func TestDNS_ServiceLookup_Dedup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeANY)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1796,7 +1985,7 @@ func TestDNS_ServiceLookup_Dedup(t *testing.T) {
 
 func TestDNS_ServiceLookup_Dedup_SRV(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a single node with multiple instances of a service.
@@ -1877,8 +2066,7 @@ func TestDNS_ServiceLookup_Dedup_SRV(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -1932,17 +2120,16 @@ func TestDNS_Recurse(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = recursor.Addr
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+recursor.Addr+`"]
+	`)
 	defer a.Shutdown()
 
 	m := new(dns.Msg)
 	m.SetQuestion("apple.com.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1964,17 +2151,16 @@ func TestDNS_Recurse_Truncation(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = recursor.Addr
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+recursor.Addr+`"]
+	`)
 	defer a.Shutdown()
 
 	m := new(dns.Msg)
 	m.SetQuestion("apple.com.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != dns.ErrTruncated {
 		t.Fatalf("err: %v", err)
 	}
@@ -2005,10 +2191,12 @@ func TestDNS_RecursorTimeout(t *testing.T) {
 	}
 	defer resolver.Close()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = resolver.LocalAddr().String() // host must cause a connection|read|write timeout
-	cfg.DNSConfig.RecursorTimeout = serverClientTimeout
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+resolver.LocalAddr().String()+`"] // host must cause a connection|read|write timeout
+		dns_config {
+			recursor_timeout = "`+serverClientTimeout.String()+`"
+		}
+	`)
 	defer a.Shutdown()
 
 	m := new(dns.Msg)
@@ -2016,10 +2204,9 @@ func TestDNS_RecursorTimeout(t *testing.T) {
 
 	// This client calling the server under test must have a longer timeout than the one we set internally
 	c := &dns.Client{Timeout: testClientTimeout}
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 
 	start := time.Now()
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 
 	duration := time.Now().Sub(start)
 
@@ -2042,7 +2229,7 @@ func TestDNS_RecursorTimeout(t *testing.T) {
 
 func TestDNS_ServiceLookup_FilterCritical(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register nodes with health checks in various states.
@@ -2170,8 +2357,7 @@ func TestDNS_ServiceLookup_FilterCritical(t *testing.T) {
 		m.SetQuestion(question, dns.TypeANY)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -2198,7 +2384,7 @@ func TestDNS_ServiceLookup_FilterCritical(t *testing.T) {
 
 func TestDNS_ServiceLookup_OnlyFailing(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register nodes with all health checks in a critical state.
@@ -2292,8 +2478,7 @@ func TestDNS_ServiceLookup_OnlyFailing(t *testing.T) {
 		m.SetQuestion(question, dns.TypeANY)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -2311,9 +2496,11 @@ func TestDNS_ServiceLookup_OnlyFailing(t *testing.T) {
 
 func TestDNS_ServiceLookup_OnlyPassing(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.DNSConfig.OnlyPassing = true
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		dns_config {
+			only_passing = true
+		}
+	`)
 	defer a.Shutdown()
 
 	// Register nodes with health checks in various states.
@@ -2412,8 +2599,7 @@ func TestDNS_ServiceLookup_OnlyPassing(t *testing.T) {
 		m.SetQuestion(question, dns.TypeANY)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -2434,7 +2620,7 @@ func TestDNS_ServiceLookup_OnlyPassing(t *testing.T) {
 
 func TestDNS_ServiceLookup_Randomize(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a large number of nodes.
@@ -2481,13 +2667,12 @@ func TestDNS_ServiceLookup_Randomize(t *testing.T) {
 	}
 	for _, question := range questions {
 		uniques := map[string]struct{}{}
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 		for i := 0; i < 10; i++ {
 			m := new(dns.Msg)
 			m.SetQuestion(question, dns.TypeANY)
 
 			c := &dns.Client{Net: "udp"}
-			in, _, err := c.Exchange(m, addr.String())
+			in, _, err := c.Exchange(m, a.DNSAddr())
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -2525,9 +2710,11 @@ func TestDNS_ServiceLookup_Randomize(t *testing.T) {
 
 func TestDNS_ServiceLookup_Truncate(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.DNSConfig.EnableTruncate = true
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		dns_config {
+			enable_truncate = true
+		}
+	`)
 	defer a.Shutdown()
 
 	// Register a large number of nodes.
@@ -2576,9 +2763,8 @@ func TestDNS_ServiceLookup_Truncate(t *testing.T) {
 		m := new(dns.Msg)
 		m.SetQuestion(question, dns.TypeANY)
 
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 		c := new(dns.Client)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil && err != dns.ErrTruncated {
 			t.Fatalf("err: %v", err)
 		}
@@ -2592,9 +2778,11 @@ func TestDNS_ServiceLookup_Truncate(t *testing.T) {
 
 func TestDNS_ServiceLookup_LargeResponses(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.DNSConfig.EnableTruncate = true
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		dns_config {
+			enable_truncate = true
+		}
+	`)
 	defer a.Shutdown()
 
 	longServiceName := "this-is-a-very-very-very-very-very-long-name-for-a-service"
@@ -2647,8 +2835,7 @@ func TestDNS_ServiceLookup_LargeResponses(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil && err != dns.ErrTruncated {
 			t.Fatalf("err: %v", err)
 		}
@@ -2692,9 +2879,12 @@ func TestDNS_ServiceLookup_LargeResponses(t *testing.T) {
 
 func testDNS_ServiceLookup_responseLimits(t *testing.T, answerLimit int, qType uint16,
 	expectedService, expectedQuery, expectedQueryID int) (bool, error) {
-	cfg := TestConfig()
-	cfg.DNSConfig.UDPAnswerLimit = answerLimit
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		node_name = "test-node"
+		dns_config {
+			udp_answer_limit = `+fmt.Sprintf("%d", answerLimit)+`
+		}
+	`)
 	defer a.Shutdown()
 
 	for i := 0; i < generateNumNodes; i++ {
@@ -2745,9 +2935,8 @@ func testDNS_ServiceLookup_responseLimits(t *testing.T, answerLimit int, qType u
 		m := new(dns.Msg)
 		m.SetQuestion(question, qType)
 
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 		c := &dns.Client{Net: "udp"}
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			return false, fmt.Errorf("err: %v", err)
 		}
@@ -2852,9 +3041,9 @@ func TestDNS_ServiceLookup_CNAME(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = recursor.Addr
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+recursor.Addr+`"]
+	`)
 	defer a.Shutdown()
 
 	// Register a node with a name for an address.
@@ -2903,8 +3092,7 @@ func TestDNS_ServiceLookup_CNAME(t *testing.T) {
 		m.SetQuestion(question, dns.TypeANY)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -2949,12 +3137,14 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = recursor.Addr
-	cfg.DNSConfig.NodeTTL = 10 * time.Second
-	cfg.DNSConfig.AllowStale = Bool(true)
-	cfg.DNSConfig.MaxStale = time.Second
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+recursor.Addr+`"]
+		dns_config {
+			node_ttl = "10s"
+			allow_stale = true
+			max_stale = "1s"
+		}
+	`)
 	defer a.Shutdown()
 
 	// Register node
@@ -2973,8 +3163,7 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 	m.SetQuestion("foo.node.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3008,7 +3197,7 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 	m = new(dns.Msg)
 	m.SetQuestion("bar.node.consul.", dns.TypeANY)
 
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3041,7 +3230,7 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 	m = new(dns.Msg)
 	m.SetQuestion("google.node.consul.", dns.TypeANY)
 
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3065,14 +3254,16 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 
 func TestDNS_ServiceLookup_TTL(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.DNSConfig.ServiceTTL = map[string]time.Duration{
-		"db": 10 * time.Second,
-		"*":  5 * time.Second,
-	}
-	cfg.DNSConfig.AllowStale = Bool(true)
-	cfg.DNSConfig.MaxStale = time.Second
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		dns_config {
+			service_ttl = {
+				"db" = "10s"
+				"*" = "5s"
+			}
+		allow_stale = true
+		max_stale = "1s"
+		}
+	`)
 	defer a.Shutdown()
 
 	// Register node with 2 services
@@ -3109,8 +3300,7 @@ func TestDNS_ServiceLookup_TTL(t *testing.T) {
 	m.SetQuestion("db.service.consul.", dns.TypeSRV)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3137,7 +3327,7 @@ func TestDNS_ServiceLookup_TTL(t *testing.T) {
 
 	m = new(dns.Msg)
 	m.SetQuestion("api.service.consul.", dns.TypeSRV)
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3165,14 +3355,16 @@ func TestDNS_ServiceLookup_TTL(t *testing.T) {
 
 func TestDNS_PreparedQuery_TTL(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.DNSConfig.ServiceTTL = map[string]time.Duration{
-		"db": 10 * time.Second,
-		"*":  5 * time.Second,
-	}
-	cfg.DNSConfig.AllowStale = Bool(true)
-	cfg.DNSConfig.MaxStale = time.Second
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		dns_config {
+			service_ttl = {
+				"db" = "10s"
+				"*" = "5s"
+			}
+		allow_stale = true
+		max_stale = "1s"
+		}
+	`)
 	defer a.Shutdown()
 
 	// Register a node and a service.
@@ -3266,8 +3458,7 @@ func TestDNS_PreparedQuery_TTL(t *testing.T) {
 	m.SetQuestion("db-ttl.query.consul.", dns.TypeSRV)
 
 	c := new(dns.Client)
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3296,7 +3487,7 @@ func TestDNS_PreparedQuery_TTL(t *testing.T) {
 	// config otherwise.
 	m = new(dns.Msg)
 	m.SetQuestion("db-nottl.query.consul.", dns.TypeSRV)
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3325,7 +3516,7 @@ func TestDNS_PreparedQuery_TTL(t *testing.T) {
 	// card value should be used.
 	m = new(dns.Msg)
 	m.SetQuestion("api-nottl.query.consul.", dns.TypeSRV)
-	in, _, err = c.Exchange(m, addr.String())
+	in, _, err = c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3353,22 +3544,22 @@ func TestDNS_PreparedQuery_TTL(t *testing.T) {
 
 func TestDNS_PreparedQuery_Failover(t *testing.T) {
 	t.Parallel()
-	cfg1 := TestConfig()
-	cfg1.Datacenter = "dc1"
-	cfg1.TranslateWanAddrs = true
-	cfg1.ACLDatacenter = ""
-	a1 := NewTestAgent(t.Name(), cfg1)
+	a1 := NewTestAgent(t.Name(), `
+		datacenter = "dc1"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a1.Shutdown()
 
-	cfg2 := TestConfig()
-	cfg2.Datacenter = "dc2"
-	cfg2.TranslateWanAddrs = true
-	cfg2.ACLDatacenter = ""
-	a2 := NewTestAgent(t.Name(), cfg2)
+	a2 := NewTestAgent(t.Name(), `
+		datacenter = "dc2"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a2.Shutdown()
 
 	// Join WAN cluster.
-	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.Ports.SerfWan)
+	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.SerfPortWAN)
 	if _, err := a2.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3429,7 +3620,7 @@ func TestDNS_PreparedQuery_Failover(t *testing.T) {
 	m.SetQuestion("my-query.query.consul.", dns.TypeSRV)
 
 	c := new(dns.Client)
-	cl_addr, _ := a1.Config.ClientListener("", a1.Config.Ports.DNS)
+	cl_addr := a1.config.DNSAddrs[0]
 	in, _, err := c.Exchange(m, cl_addr.String())
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -3465,7 +3656,7 @@ func TestDNS_PreparedQuery_Failover(t *testing.T) {
 
 func TestDNS_ServiceLookup_SRV_RFC(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -3497,8 +3688,7 @@ func TestDNS_ServiceLookup_SRV_RFC(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3540,7 +3730,7 @@ func TestDNS_ServiceLookup_SRV_RFC(t *testing.T) {
 
 func TestDNS_ServiceLookup_SRV_RFC_TCP_Default(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -3572,8 +3762,7 @@ func TestDNS_ServiceLookup_SRV_RFC_TCP_Default(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3624,13 +3813,13 @@ func TestDNS_ServiceLookup_FilterACL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run("ACLToken == "+tt.token, func(t *testing.T) {
-			cfg := TestConfig()
-			cfg.ACLToken = tt.token
-			cfg.ACLMasterToken = "root"
-			cfg.ACLDatacenter = "dc1"
-			cfg.ACLDownPolicy = "deny"
-			cfg.ACLDefaultPolicy = "deny"
-			a := NewTestAgent(t.Name(), cfg)
+			a := NewTestAgent(t.Name(), `
+				acl_token = "`+tt.token+`"
+				acl_master_token = "root"
+				acl_datacenter = "dc1"
+				acl_down_policy = "deny"
+				acl_default_policy = "deny"
+			`)
 			defer a.Shutdown()
 
 			// Register a service
@@ -3651,11 +3840,10 @@ func TestDNS_ServiceLookup_FilterACL(t *testing.T) {
 
 			// Set up the DNS query
 			c := new(dns.Client)
-			addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 			m := new(dns.Msg)
 			m.SetQuestion("foo.service.consul.", dns.TypeA)
 
-			in, _, err := c.Exchange(m, addr.String())
+			in, _, err := c.Exchange(m, a.DNSAddr())
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -3668,7 +3856,7 @@ func TestDNS_ServiceLookup_FilterACL(t *testing.T) {
 
 func TestDNS_AddressLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Look up the addresses
@@ -3680,8 +3868,7 @@ func TestDNS_AddressLookup(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3705,7 +3892,7 @@ func TestDNS_AddressLookup(t *testing.T) {
 
 func TestDNS_AddressLookupIPV6(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Look up the addresses
@@ -3718,8 +3905,7 @@ func TestDNS_AddressLookupIPV6(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3743,17 +3929,15 @@ func TestDNS_AddressLookupIPV6(t *testing.T) {
 
 func TestDNS_NonExistingLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
-
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 
 	// lookup a non-existing node, we should receive a SOA
 	m := new(dns.Msg)
 	m.SetQuestion("nonexisting.consul.", dns.TypeANY)
 
 	c := new(dns.Client)
-	in, _, err := c.Exchange(m, addr.String())
+	in, _, err := c.Exchange(m, a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -3773,7 +3957,7 @@ func TestDNS_NonExistingLookup(t *testing.T) {
 
 func TestDNS_NonExistingLookupEmptyAorAAAA(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a v6-only service and a v4-only service.
@@ -3852,9 +4036,8 @@ func TestDNS_NonExistingLookupEmptyAorAAAA(t *testing.T) {
 		m := new(dns.Msg)
 		m.SetQuestion(question, dns.TypeAAAA)
 
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 		c := new(dns.Client)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3862,7 +4045,6 @@ func TestDNS_NonExistingLookupEmptyAorAAAA(t *testing.T) {
 		if len(in.Ns) != 1 {
 			t.Fatalf("Bad: %#v", in)
 		}
-
 		soaRec, ok := in.Ns[0].(*dns.SOA)
 		if !ok {
 			t.Fatalf("Bad: %#v", in.Ns[0])
@@ -3874,6 +4056,7 @@ func TestDNS_NonExistingLookupEmptyAorAAAA(t *testing.T) {
 		if in.Rcode != dns.RcodeSuccess {
 			t.Fatalf("Bad: %#v", in)
 		}
+
 	}
 
 	// Check for ipv4 records on ipv6-only service directly and via the
@@ -3886,9 +4069,8 @@ func TestDNS_NonExistingLookupEmptyAorAAAA(t *testing.T) {
 		m := new(dns.Msg)
 		m.SetQuestion(question, dns.TypeA)
 
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
 		c := new(dns.Client)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3913,10 +4095,12 @@ func TestDNS_NonExistingLookupEmptyAorAAAA(t *testing.T) {
 
 func TestDNS_PreparedQuery_AllowStale(t *testing.T) {
 	t.Parallel()
-	cfg := TestConfig()
-	cfg.DNSConfig.AllowStale = Bool(true)
-	cfg.DNSConfig.MaxStale = time.Second
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		dns_config {
+			allow_stale = true
+			max_stale = "1s"
+		}
+	`)
 	defer a.Shutdown()
 
 	m := MockPreparedQuery{
@@ -3938,8 +4122,7 @@ func TestDNS_PreparedQuery_AllowStale(t *testing.T) {
 		m.SetQuestion("nope.query.consul.", dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3955,12 +4138,13 @@ func TestDNS_PreparedQuery_AllowStale(t *testing.T) {
 		if soaRec.Hdr.Ttl != 0 {
 			t.Fatalf("Bad: %#v", in.Ns[0])
 		}
+
 	}
 }
 
 func TestDNS_InvalidQueries(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Try invalid forms of queries that should hit the special invalid case
@@ -3976,8 +4160,7 @@ func TestDNS_InvalidQueries(t *testing.T) {
 		m.SetQuestion(question, dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		in, _, err := c.Exchange(m, addr.String())
+		in, _, err := c.Exchange(m, a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -3993,12 +4176,13 @@ func TestDNS_InvalidQueries(t *testing.T) {
 		if soaRec.Hdr.Ttl != 0 {
 			t.Fatalf("Bad: %#v", in.Ns[0])
 		}
+
 	}
 }
 
 func TestDNS_PreparedQuery_AgentSource(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	m := MockPreparedQuery{
@@ -4022,8 +4206,7 @@ func TestDNS_PreparedQuery_AgentSource(t *testing.T) {
 		m.SetQuestion("foo.query.consul.", dns.TypeSRV)
 
 		c := new(dns.Client)
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		if _, _, err := c.Exchange(m, addr.String()); err != nil {
+		if _, _, err := c.Exchange(m, a.DNSAddr()); err != nil {
 			t.Fatalf("err: %v", err)
 		}
 	}
@@ -4055,8 +4238,8 @@ func TestDNS_trimUDPResponse_NoTrim(t *testing.T) {
 		},
 	}
 
-	config := &DefaultConfig().DNSConfig
-	if trimmed := trimUDPResponse(config, req, resp); trimmed {
+	cfg := config.DefaultRuntimeConfig(`data_dir = "a" bind_addr = "127.0.0.1"`)
+	if trimmed := trimUDPResponse(req, resp, cfg.DNSUDPAnswerLimit); trimmed {
 		t.Fatalf("Bad %#v", *resp)
 	}
 
@@ -4089,10 +4272,10 @@ func TestDNS_trimUDPResponse_NoTrim(t *testing.T) {
 
 func TestDNS_trimUDPResponse_TrimLimit(t *testing.T) {
 	t.Parallel()
-	config := &DefaultConfig().DNSConfig
+	cfg := config.DefaultRuntimeConfig(`data_dir = "a" bind_addr = "127.0.0.1"`)
 
 	req, resp, expected := &dns.Msg{}, &dns.Msg{}, &dns.Msg{}
-	for i := 0; i < config.UDPAnswerLimit+1; i++ {
+	for i := 0; i < cfg.DNSUDPAnswerLimit+1; i++ {
 		target := fmt.Sprintf("ip-10-0-1-%d.node.dc1.consul.", 185+i)
 		srv := &dns.SRV{
 			Hdr: dns.RR_Header{
@@ -4113,13 +4296,13 @@ func TestDNS_trimUDPResponse_TrimLimit(t *testing.T) {
 
 		resp.Answer = append(resp.Answer, srv)
 		resp.Extra = append(resp.Extra, a)
-		if i < config.UDPAnswerLimit {
+		if i < cfg.DNSUDPAnswerLimit {
 			expected.Answer = append(expected.Answer, srv)
 			expected.Extra = append(expected.Extra, a)
 		}
 	}
 
-	if trimmed := trimUDPResponse(config, req, resp); !trimmed {
+	if trimmed := trimUDPResponse(req, resp, cfg.DNSUDPAnswerLimit); !trimmed {
 		t.Fatalf("Bad %#v", *resp)
 	}
 	if !reflect.DeepEqual(resp, expected) {
@@ -4129,7 +4312,7 @@ func TestDNS_trimUDPResponse_TrimLimit(t *testing.T) {
 
 func TestDNS_trimUDPResponse_TrimSize(t *testing.T) {
 	t.Parallel()
-	config := &DefaultConfig().DNSConfig
+	cfg := config.DefaultRuntimeConfig(`data_dir = "a" bind_addr = "127.0.0.1"`)
 
 	req, resp := &dns.Msg{}, &dns.Msg{}
 	for i := 0; i < 100; i++ {
@@ -4157,7 +4340,7 @@ func TestDNS_trimUDPResponse_TrimSize(t *testing.T) {
 
 	// We don't know the exact trim, but we know the resulting answer
 	// data should match its extra data.
-	if trimmed := trimUDPResponse(config, req, resp); !trimmed {
+	if trimmed := trimUDPResponse(req, resp, cfg.DNSUDPAnswerLimit); !trimmed {
 		t.Fatalf("Bad %#v", *resp)
 	}
 	if len(resp.Answer) == 0 || len(resp.Answer) != len(resp.Extra) {
@@ -4182,7 +4365,7 @@ func TestDNS_trimUDPResponse_TrimSize(t *testing.T) {
 
 func TestDNS_trimUDPResponse_TrimSizeEDNS(t *testing.T) {
 	t.Parallel()
-	config := &DefaultConfig().DNSConfig
+	cfg := config.DefaultRuntimeConfig(`data_dir = "a" bind_addr = "127.0.0.1"`)
 
 	req, resp := &dns.Msg{}, &dns.Msg{}
 
@@ -4216,10 +4399,10 @@ func TestDNS_trimUDPResponse_TrimSizeEDNS(t *testing.T) {
 	respEDNS.Extra = append(respEDNS.Extra, resp.Extra...)
 
 	// Trim each response
-	if trimmed := trimUDPResponse(config, req, resp); !trimmed {
+	if trimmed := trimUDPResponse(req, resp, cfg.DNSUDPAnswerLimit); !trimmed {
 		t.Errorf("expected response to be trimmed: %#v", resp)
 	}
-	if trimmed := trimUDPResponse(config, reqEDNS, respEDNS); !trimmed {
+	if trimmed := trimUDPResponse(reqEDNS, respEDNS, cfg.DNSUDPAnswerLimit); !trimmed {
 		t.Errorf("expected edns to be trimmed: %#v", resp)
 	}
 
@@ -4485,10 +4668,10 @@ func TestDNS_syncExtra(t *testing.T) {
 
 func TestDNS_Compression_trimUDPResponse(t *testing.T) {
 	t.Parallel()
-	config := &DefaultConfig().DNSConfig
+	cfg := config.DefaultRuntimeConfig(`data_dir = "a" bind_addr = "127.0.0.1"`)
 
 	req, m := dns.Msg{}, dns.Msg{}
-	trimUDPResponse(config, &req, &m)
+	trimUDPResponse(&req, &m, cfg.DNSUDPAnswerLimit)
 	if m.Compress {
 		t.Fatalf("compression should be off")
 	}
@@ -4496,7 +4679,7 @@ func TestDNS_Compression_trimUDPResponse(t *testing.T) {
 	// The trim function temporarily turns off compression, so we need to
 	// make sure the setting gets restored properly.
 	m.Compress = true
-	trimUDPResponse(config, &req, &m)
+	trimUDPResponse(&req, &m, cfg.DNSUDPAnswerLimit)
 	if !m.Compress {
 		t.Fatalf("compression should be on")
 	}
@@ -4504,7 +4687,7 @@ func TestDNS_Compression_trimUDPResponse(t *testing.T) {
 
 func TestDNS_Compression_Query(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register a node with a service.
@@ -4553,8 +4736,7 @@ func TestDNS_Compression_Query(t *testing.T) {
 		m := new(dns.Msg)
 		m.SetQuestion(question, dns.TypeSRV)
 
-		addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-		conn, err := dns.Dial("udp", addr.String())
+		conn, err := dns.Dial("udp", a.DNSAddr())
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -4591,7 +4773,7 @@ func TestDNS_Compression_Query(t *testing.T) {
 
 func TestDNS_Compression_ReverseLookup(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node.
@@ -4608,8 +4790,7 @@ func TestDNS_Compression_ReverseLookup(t *testing.T) {
 	m := new(dns.Msg)
 	m.SetQuestion("2.0.0.127.in-addr.arpa.", dns.TypeANY)
 
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	conn, err := dns.Dial("udp", addr.String())
+	conn, err := dns.Dial("udp", a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -4648,16 +4829,15 @@ func TestDNS_Compression_Recurse(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	cfg := TestConfig()
-	cfg.DNSRecursor = recursor.Addr
-	a := NewTestAgent(t.Name(), cfg)
+	a := NewTestAgent(t.Name(), `
+		recursors = ["`+recursor.Addr+`"]
+	`)
 	defer a.Shutdown()
 
 	m := new(dns.Msg)
 	m.SetQuestion("apple.com.", dns.TypeANY)
 
-	addr, _ := a.Config.ClientListener("", a.Config.Ports.DNS)
-	conn, err := dns.Dial("udp", addr.String())
+	conn, err := dns.Dial("udp", a.DNSAddr())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -4686,5 +4866,28 @@ func TestDNS_Compression_Recurse(t *testing.T) {
 	// sure the message is smaller to see if it's respecting the flag.
 	if compressed == 0 || unc == 0 || compressed >= unc {
 		t.Fatalf("doesn't look compressed: %d vs. %d", compressed, unc)
+	}
+}
+
+func TestDNSInvalidRegex(t *testing.T) {
+	tests := []struct {
+		desc    string
+		in      string
+		invalid bool
+	}{
+		{"Valid Hostname", "testnode", false},
+		{"Valid Hostname", "test-node", false},
+		{"Invalid Hostname with special chars", "test#$$!node", true},
+		{"Invalid Hostname with special chars in the end", "testnode%^", true},
+		{"Whitespace", "  ", true},
+		{"Only special chars", "./$", true},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got, want := InvalidDnsRe.MatchString(test.in), test.invalid; got != want {
+				t.Fatalf("Expected %v to return %v", test.in, want)
+			}
+		})
+
 	}
 }
