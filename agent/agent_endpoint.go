@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
@@ -34,14 +35,6 @@ func (s *HTTPServer) AgentSelf(resp http.ResponseWriter, req *http.Request) (int
 		return nil, MethodNotAllowedError{req.Method, []string{"GET"}}
 	}
 
-	var cs lib.CoordinateSet
-	if !s.agent.config.DisableCoordinates {
-		var err error
-		if cs, err = s.agent.GetLANCoordinate(); err != nil {
-			return nil, err
-		}
-	}
-
 	// Fetch the ACL token, if any, and enforce agent policy.
 	var token string
 	s.parseToken(req, &token)
@@ -53,15 +46,25 @@ func (s *HTTPServer) AgentSelf(resp http.ResponseWriter, req *http.Request) (int
 		return nil, acl.ErrPermissionDenied
 	}
 
+	var cs lib.CoordinateSet
+	if !s.agent.config.DisableCoordinates {
+		var err error
+		if cs, err = s.agent.GetLANCoordinate(); err != nil {
+			return nil, err
+		}
+	}
+
 	config := struct {
 		Datacenter string
 		NodeName   string
+		NodeID     string
 		Revision   string
 		Server     bool
 		Version    string
 	}{
 		Datacenter: s.agent.config.Datacenter,
 		NodeName:   s.agent.config.NodeName,
+		NodeID:     string(s.agent.config.NodeID),
 		Revision:   s.agent.config.Revision,
 		Server:     s.agent.config.ServerMode,
 		Version:    s.agent.config.Version,
@@ -72,7 +75,7 @@ func (s *HTTPServer) AgentSelf(resp http.ResponseWriter, req *http.Request) (int
 		Coord:       cs[s.agent.config.SegmentName],
 		Member:      s.agent.LocalMember(),
 		Stats:       s.agent.Stats(),
-		Meta:        s.agent.state.Metadata(),
+		Meta:        s.agent.State.Metadata(),
 	}, nil
 }
 
@@ -137,15 +140,17 @@ func (s *HTTPServer) AgentServices(resp http.ResponseWriter, req *http.Request) 
 	var token string
 	s.parseToken(req, &token)
 
-	services := s.agent.state.Services()
+	services := s.agent.State.Services()
 	if err := s.agent.filterServices(token, &services); err != nil {
 		return nil, err
 	}
 
 	// Use empty list instead of nil
-	for _, s := range services {
+	for id, s := range services {
 		if s.Tags == nil {
-			s.Tags = make([]string, 0)
+			clone := *s
+			clone.Tags = make([]string, 0)
+			services[id] = &clone
 		}
 	}
 
@@ -161,16 +166,17 @@ func (s *HTTPServer) AgentChecks(resp http.ResponseWriter, req *http.Request) (i
 	var token string
 	s.parseToken(req, &token)
 
-	checks := s.agent.state.Checks()
+	checks := s.agent.State.Checks()
 	if err := s.agent.filterChecks(token, &checks); err != nil {
 		return nil, err
 	}
 
 	// Use empty list instead of nil
-	// checks needs to be a deep copy for this not be racy
-	for _, c := range checks {
+	for id, c := range checks {
 		if c.ServiceTags == nil {
-			c.ServiceTags = make([]string, 0)
+			clone := *c
+			clone.ServiceTags = make([]string, 0)
+			checks[id] = &clone
 		}
 	}
 
@@ -304,7 +310,7 @@ func (s *HTTPServer) AgentForceLeave(resp http.ResponseWriter, req *http.Request
 // services and checks to the server. If the operation fails, we only
 // only warn because the write did succeed and anti-entropy will sync later.
 func (s *HTTPServer) syncChanges() {
-	if err := s.agent.state.syncChanges(); err != nil {
+	if err := s.agent.State.SyncChanges(); err != nil {
 		s.agent.logger.Printf("[ERR] agent: failed to sync changes: %v", err)
 	}
 }
@@ -490,9 +496,9 @@ func (s *HTTPServer) AgentCheckUpdate(resp http.ResponseWriter, req *http.Reques
 	}
 
 	total := len(update.Output)
-	if total > CheckBufSize {
+	if total > checks.BufSize {
 		update.Output = fmt.Sprintf("%s ... (captured %d of %d bytes)",
-			update.Output[:CheckBufSize], CheckBufSize, total)
+			update.Output[:checks.BufSize], checks.BufSize, total)
 	}
 
 	checkID := types.CheckID(strings.TrimPrefix(req.URL.Path, "/v1/agent/check/update/"))
@@ -808,6 +814,9 @@ func (h *httpLogHandler) HandleLog(log string) {
 }
 
 func (s *HTTPServer) AgentToken(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
 	if req.Method != "PUT" {
 		return nil, MethodNotAllowedError{req.Method, []string{"PUT"}}
 	}

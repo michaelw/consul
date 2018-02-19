@@ -244,7 +244,7 @@ RETRY:
 	if firstCheck.IsZero() {
 		firstCheck = time.Now()
 	}
-	if time.Now().Sub(firstCheck) < s.config.RPCHoldTimeout {
+	if time.Since(firstCheck) < s.config.RPCHoldTimeout {
 		jitter := lib.RandomStagger(s.config.RPCHoldTimeout / jitterFraction)
 		select {
 		case <-time.After(jitter):
@@ -307,11 +307,13 @@ func (s *Server) forwardDC(method, dc string, args interface{}, reply interface{
 func (s *Server) globalRPC(method string, args interface{},
 	reply structs.CompoundResponse) error {
 
-	errorCh := make(chan error)
-	respCh := make(chan interface{})
-
 	// Make a new request into each datacenter
 	dcs := s.router.GetDatacenters()
+
+	replies, total := 0, len(dcs)
+	errorCh := make(chan error, total)
+	respCh := make(chan interface{}, total)
+
 	for _, dc := range dcs {
 		go func(dc string) {
 			rr := reply.New()
@@ -323,7 +325,6 @@ func (s *Server) globalRPC(method string, args interface{},
 		}(dc)
 	}
 
-	replies, total := 0, len(dcs)
 	for replies < total {
 		select {
 		case err := <-errorCh:
@@ -443,7 +444,7 @@ func (s *Server) setQueryMeta(m *structs.QueryMeta) {
 		m.LastContact = 0
 		m.KnownLeader = true
 	} else {
-		m.LastContact = time.Now().Sub(s.raft.LastContact())
+		m.LastContact = time.Since(s.raft.LastContact())
 		m.KnownLeader = (s.raft.Leader() != "")
 	}
 }

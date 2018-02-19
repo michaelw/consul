@@ -21,15 +21,15 @@ type Source struct {
 	Data   string
 }
 
-func NewSource(name, data string) Source {
-	return Source{Name: name, Format: FormatFrom(name), Data: data}
-}
-
 func FormatFrom(name string) string {
-	if strings.HasSuffix(name, ".hcl") {
+	switch {
+	case strings.HasSuffix(name, ".json"):
+		return "json"
+	case strings.HasSuffix(name, ".hcl"):
 		return "hcl"
+	default:
+		return ""
 	}
-	return "json"
 }
 
 // Parse parses a config fragment in either JSON or HCL format.
@@ -175,6 +175,7 @@ type Config struct {
 	DisableUpdateCheck          *bool                    `json:"disable_update_check,omitempty" hcl:"disable_update_check" mapstructure:"disable_update_check"`
 	DiscardCheckOutput          *bool                    `json:"discard_check_output" hcl:"discard_check_output" mapstructure:"discard_check_output"`
 	EnableACLReplication        *bool                    `json:"enable_acl_replication,omitempty" hcl:"enable_acl_replication" mapstructure:"enable_acl_replication"`
+	EnableAgentTLSForChecks     *bool                    `json:"enable_agent_tls_for_checks,omitempty" hcl:"enable_agent_tls_for_checks" mapstructure:"enable_agent_tls_for_checks"`
 	EnableDebug                 *bool                    `json:"enable_debug,omitempty" hcl:"enable_debug" mapstructure:"enable_debug"`
 	EnableScriptChecks          *bool                    `json:"enable_script_checks,omitempty" hcl:"enable_script_checks" mapstructure:"enable_script_checks"`
 	EnableSyslog                *bool                    `json:"enable_syslog,omitempty" hcl:"enable_syslog" mapstructure:"enable_syslog"`
@@ -232,6 +233,12 @@ type Config struct {
 	VerifyOutgoing              *bool                    `json:"verify_outgoing,omitempty" hcl:"verify_outgoing" mapstructure:"verify_outgoing"`
 	VerifyServerHostname        *bool                    `json:"verify_server_hostname,omitempty" hcl:"verify_server_hostname" mapstructure:"verify_server_hostname"`
 	Watches                     []map[string]interface{} `json:"watches,omitempty" hcl:"watches" mapstructure:"watches"`
+
+	// This isn't used by Consul but we've documented a feature where users
+	// can deploy their snapshot agent configs alongside their Consul configs
+	// so we have a placeholder here so it can be parsed but this doesn't
+	// manifest itself in any way inside the runtime config.
+	SnapshotAgent map[string]interface{} `json:"snapshot_agent,omitempty" hcl:"snapshot_agent" mapstructure:"snapshot_agent"`
 
 	// non-user configurable values
 	ACLDisabledTTL             *string  `json:"acl_disabled_ttl,omitempty" hcl:"acl_disabled_ttl" mapstructure:"acl_disabled_ttl"`
@@ -334,6 +341,8 @@ type CheckDefinition struct {
 	Interval                       *string             `json:"interval,omitempty" hcl:"interval" mapstructure:"interval"`
 	DockerContainerID              *string             `json:"docker_container_id,omitempty" hcl:"docker_container_id" mapstructure:"docker_container_id"`
 	Shell                          *string             `json:"shell,omitempty" hcl:"shell" mapstructure:"shell"`
+	GRPC                           *string             `json:"grpc,omitempty" hcl:"grpc" mapstructure:"grpc"`
+	GRPCUseTLS                     *bool               `json:"grpc_use_tls,omitempty" hcl:"grpc_use_tls" mapstructure:"grpc_use_tls"`
 	TLSSkipVerify                  *bool               `json:"tls_skip_verify,omitempty" hcl:"tls_skip_verify" mapstructure:"tls_skip_verify"`
 	Timeout                        *string             `json:"timeout,omitempty" hcl:"timeout" mapstructure:"timeout"`
 	TTL                            *string             `json:"ttl,omitempty" hcl:"ttl" mapstructure:"ttl"`
